@@ -1,5 +1,5 @@
-import os
 import spaces
+import os
 import re
 from pathlib import Path
 from typing import List, Dict
@@ -947,6 +947,7 @@ def bm25_search(
 # LLM
 # ============================================================
 
+
 def load_llm():
 
     global llm
@@ -954,6 +955,12 @@ def load_llm():
     if llm is None:
 
         print("Loading Qwen 0.5B...")
+
+        device = (
+            "cuda"
+            if os.getenv("SPACES_ZERO_GPU") == "1"
+            else -1
+        )
 
         llm = pipeline(
             "text-generation",
@@ -968,13 +975,12 @@ def load_llm():
 
             return_full_text=False,
 
-            device=-1
+            device=device
         )
 
         print("Qwen loaded.")
 
     return llm
-
 
 # ============================================================
 # INTENT
@@ -1647,7 +1653,20 @@ Page: {page}
 # LLM ANSWER
 # ============================================================
 
-@spaces.GPU
+@spaces.GPU(duration=15)
+def run_llm(prompt: str) -> str:
+
+    model = load_llm()
+
+    result = model(prompt)
+
+    if not result:
+        return ""
+
+    return result[0].get(
+        "generated_text",
+        ""
+    ).strip()
 def generate_answer(
     query: str,
     documents: List[Document]
@@ -1711,9 +1730,7 @@ Give a concise answer.
 Answer:
 """
 
-    model = load_llm()
-
-    result = model(prompt)
+    result = run_llm(prompt)
 
     if not result:
 
@@ -1722,10 +1739,7 @@ Answer:
             "in the uploaded document."
         )
 
-    answer = result[0].get(
-        "generated_text",
-        ""
-    ).strip()
+    answer = result
 
     answer = re.sub(
         r"^(answer|response)\s*:\s*",
