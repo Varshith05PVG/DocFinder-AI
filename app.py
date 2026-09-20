@@ -42,6 +42,9 @@ TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 if os.path.exists(TESSERACT_PATH):
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
 
+if os.path.exists(TESSERACT_PATH):
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+
 
 # ============================================================
 # GLOBAL STATE
