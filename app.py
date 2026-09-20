@@ -2142,144 +2142,112 @@ with gr.Blocks(
 # PROCESS FLOW
 # ============================================================
 
+# ============================================================
+# PROCESS DOCUMENT WITH LOADER
+# ============================================================
+
 def process_with_loader(file):
 
-    # Show the CUSTOM loader first. The previous version only
-    # changed visibility, so the loader component was visible but
-    # contained no HTML.
+    # --------------------------------------------------------
+    # STEP 1: Show custom processing loader immediately
+    # --------------------------------------------------------
+
     yield (
-        gr.update(
-            value=PROCESS_LOADER_HTML,
-            visible=True
-        ),
+        PROCESS_LOADER_HTML,
         "",
-        gr.update(
-            visible=True
-        ),
-        gr.update(
-            visible=False
-        ),
-        gr.update(
-            visible=False
-        )
+        gr.update(visible=True),
+        gr.update(visible=False),
+        gr.update(visible=False)
     )
 
-    status, message = process_document(
-        file
-    )
+    # --------------------------------------------------------
+    # STEP 2: Process the uploaded document
+    # --------------------------------------------------------
+
+    status, message = process_document(file)
+
+    # --------------------------------------------------------
+    # STEP 3: If document is ready
+    # --------------------------------------------------------
 
     if status == "ready":
 
         yield (
-            gr.update(
-                visible=False
-            ),
+            "",
             message,
-            gr.update(
-                visible=False
-            ),
-            gr.update(
-                visible=True
-            ),
-            gr.update(
-                visible=False
-            )
+            gr.update(visible=False),
+            gr.update(visible=True),
+            gr.update(visible=False)
         )
+
+    # --------------------------------------------------------
+    # STEP 4: If processing failed
+    # --------------------------------------------------------
 
     else:
 
         yield (
-            gr.update(
-                visible=False
-            ),
+            "",
             message,
-            gr.update(
-                visible=False
-            ),
-            gr.update(
-                visible=True
-            ),
-            gr.update(
-                visible=False
-            )
+            gr.update(visible=False),
+            gr.update(visible=True),
+            gr.update(visible=False)
         )
-
-
 # ============================================================
 # EVENTS
 # ============================================================
 
-process_button.click(
+with gr.Blocks(...) as demo:
 
-    fn=process_with_loader,
+    # all your UI components
+    # ...
+    
+    process_button.click(
+        fn=process_with_loader,
+        inputs=[file_input],
+        outputs=[
+            process_loader,
+            process_status,
+            upload_page,
+            search_page,
+            search_loader
+        ],
+        show_progress="hidden"
+    )
 
-    inputs=[
-        file_input
-    ],
+    question.submit(
+        fn=search_document,
+        inputs=[question],
+        outputs=[
+            search_loader,
+            answer_output,
+            sources_output,
+            search_status,
+            question
+        ],
+        show_progress="hidden"
+    )
 
-    outputs=[
-        process_loader,
-        process_status,
-        upload_page,
-        search_page,
-        search_loader
-    ],
-
-    show_progress="hidden"
-)
-
-
-question.submit(
-
-    fn=search_document,
-
-    inputs=[
-        question
-    ],
-
-    outputs=[
-        search_loader,
-        answer_output,
-        sources_output,
-        search_status,
-        question
-    ],
-
-    show_progress="hidden",
-
-    js="() => { document.activeElement?.blur(); }"
-)
-
-
-reset_button.click(
-
-    fn=reset_app,
-
-    inputs=[],
-
-    outputs=[
-        upload_page,
-        search_page,
-        file_input,
-        process_status,
-        search_loader,
-        answer_output,
-        sources_output
-    ],
-
-    show_progress="hidden"
-)
+    reset_button.click(
+        fn=reset_app,
+        inputs=[],
+        outputs=[
+            upload_page,
+            search_page,
+            file_input,
+            process_status,
+            search_loader,
+            answer_output,
+            sources_output
+        ],
+        show_progress="hidden"
+    )
 
 
-# ============================================================
-# LAUNCH
-# ============================================================
-
-# Required for generator-based custom loader updates to stream
-# to the browser immediately.
 demo.queue()
 
 demo.launch(
     inbrowser=True,
     css=CSS
 )
+
