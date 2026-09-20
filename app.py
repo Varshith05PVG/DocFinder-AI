@@ -956,26 +956,13 @@ def load_llm():
 
         print("Loading Qwen 0.5B...")
 
-        device = (
-            "cuda"
-            if os.getenv("SPACES_ZERO_GPU") == "1"
-            else -1
-        )
-
         llm = pipeline(
             "text-generation",
-
             model=LLM_MODEL,
-
             tokenizer=LLM_MODEL,
-
             max_new_tokens=MAX_NEW_TOKENS,
-
             do_sample=False,
-
-            return_full_text=False,
-
-            device=device
+            return_full_text=False
         )
 
         print("Qwen loaded.")
