@@ -1,4 +1,12 @@
+# ============================================================
+# DocFinder AI — RAG Based AI Assistant
+# ZeroGPU-compatible version
+# ============================================================
+
+# IMPORTANT:
+# spaces MUST be imported before torch / transformers
 import spaces
+
 import os
 import re
 from pathlib import Path
@@ -7,7 +15,6 @@ from typing import List, Dict
 import gradio as gr
 import pymupdf
 import pytesseract
-
 from PIL import Image
 from docx import Document as DocxDocument
 
@@ -21,12 +28,13 @@ from transformers import pipeline
 
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 
 APP_TITLE = "DocFinder AI"
 
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
 LLM_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 
 SEMANTIC_TOP_K = 8
@@ -40,9 +48,12 @@ MAX_NEW_TOKENS = 70
 
 TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
-if os.path.exists(TESSERACT_PATH):
-    pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
 
+# ============================================================
+# TESSERACT
+# ============================================================
+
+# Windows local environment
 if os.path.exists(TESSERACT_PATH):
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
 
@@ -54,16 +65,1186 @@ if os.path.exists(TESSERACT_PATH):
 all_chunks: List[Document] = []
 
 vector_store = None
+
 bm25 = None
 
 embedding_model = None
-llm = None
 
 current_filename = ""
 
+# ------------------------------------------------------------
+# ZERO GPU / LLM
+# ------------------------------------------------------------
+#
+# IMPORTANT:
+# On Hugging Face ZeroGPU, model placement must happen at
+# module scope so ZeroGPU can intercept/register it.
+#
+# Locally, use CPU.
+#
+# ZeroGPU sets SPACES_ZERO_GPU=1.
+# ------------------------------------------------------------
+
+if os.getenv("SPACES_ZERO_GPU") == "1":
+    LLM_DEVICE = "cuda"
+else:
+    LLM_DEVICE = -1
+
 
 # ============================================================
-# LOADER
+# LOAD EMBEDDING MODEL
+# ============================================================
+
+def load_embeddings():
+
+    global embedding_model
+
+    if embedding_model is None:
+
+        print("Loading embedding model...")
+
+        embedding_model = HuggingFaceEmbeddings(
+            model_name=EMBEDDING_MODEL,
+            model_kwargs={
+                "device": "cpu"
+            },
+            encode_kwargs={
+                "normalize_embeddings": True
+            }
+        )
+
+        print("Embedding model loaded.")
+
+    return embedding_model
+
+
+# ============================================================
+# ZERO GPU — LOAD QWEN AT MODULE LEVEL
+# ============================================================
+
+print("Preparing Qwen 0.5B...")
+
+llm = pipeline(
+    "text-generation",
+    model=LLM_MODEL,
+    tokenizer=LLM_MODEL,
+    max_new_tokens=MAX_NEW_TOKENS,
+    do_sample=False,
+    return_full_text=False,
+    device=LLM_DEVICE
+)
+
+print("Qwen pipeline ready.")
+
+
+# ============================================================
+# ZERO GPU — ACTUAL LLM GENERATION
+# ============================================================
+
+@spaces.GPU(duration=15)
+def run_llm(prompt: str) -> str:
+
+    result = llm(prompt)
+
+    if not result:
+        return ""
+
+    return result[0].get(
+        "generated_text",
+        ""
+    ).strip()
+
+
+# ============================================================
+# FILE EXTRACTION
+# ============================================================
+
+def extract_pdf(file_path: str) -> List[Document]:
+
+    documents = []
+
+    pdf = pymupdf.open(file_path)
+
+    print(f"Pages loaded: {len(pdf)}")
+
+    for page_number, page in enumerate(pdf):
+
+        text = page.get_text("text").strip()
+
+        # ----------------------------------------------------
+        # OCR fallback for scanned PDFs
+        # ----------------------------------------------------
+
+        if not text:
+
+            print(
+                f"Page {page_number + 1}: "
+                f"No direct text. Running OCR..."
+            )
+
+            pix = page.get_pixmap(
+                matrix=pymupdf.Matrix(2, 2)
+            )
+
+            img = Image.frombytes(
+                "RGB",
+                [pix.width, pix.height],
+                pix.samples
+            )
+
+            text = pytesseract.image_to_string(
+                img
+            ).strip()
+
+        if text:
+
+            documents.append(
+                Document(
+                    page_content=text,
+                    metadata={
+                        "page": page_number + 1
+                    }
+                )
+            )
+
+    pdf.close()
+
+    return documents
+
+
+def extract_docx(file_path: str) -> List[Document]:
+
+    doc = DocxDocument(file_path)
+
+    text_parts = []
+
+    for paragraph in doc.paragraphs:
+
+        text = paragraph.text.strip()
+
+        if text:
+            text_parts.append(text)
+
+    text = "\n".join(text_parts)
+
+    if not text:
+        return []
+
+    return [
+        Document(
+            page_content=text,
+            metadata={
+                "page": 1
+            }
+        )
+    ]
+
+
+def extract_txt(file_path: str) -> List[Document]:
+
+    with open(
+        file_path,
+        "r",
+        encoding="utf-8",
+        errors="ignore"
+    ) as f:
+
+        text = f.read().strip()
+
+    if not text:
+        return []
+
+    return [
+        Document(
+            page_content=text,
+            metadata={
+                "page": 1
+            }
+        )
+    ]
+
+
+def extract_document(file_path: str) -> List[Document]:
+
+    extension = Path(file_path).suffix.lower()
+
+    if extension == ".pdf":
+
+        return extract_pdf(file_path)
+
+    if extension == ".docx":
+
+        return extract_docx(file_path)
+
+    if extension == ".txt":
+
+        return extract_txt(file_path)
+
+    raise ValueError(
+        "Unsupported file type. "
+        "Please upload PDF, DOCX, or TXT."
+    )
+
+
+# ============================================================
+# CHUNKING
+# ============================================================
+
+def create_chunks(
+    documents: List[Document]
+) -> List[Document]:
+
+    splitter = RecursiveCharacterTextSplitter(
+
+        chunk_size=CHUNK_SIZE,
+
+        chunk_overlap=CHUNK_OVERLAP,
+
+        separators=[
+            "\n\n",
+            "\n",
+            ". ",
+            ": ",
+            ", ",
+            " ",
+            ""
+        ]
+    )
+
+    chunks = splitter.split_documents(
+        documents
+    )
+
+    return chunks
+
+
+# ============================================================
+# BUILD BM25
+# ============================================================
+
+def build_bm25(chunks: List[Document]):
+
+    global bm25
+
+    tokenized_documents = [
+        chunk.page_content.lower().split()
+        for chunk in chunks
+    ]
+
+    if tokenized_documents:
+
+        bm25 = BM25Okapi(
+            tokenized_documents
+        )
+
+    else:
+
+        bm25 = None
+
+
+# ============================================================
+# PROCESS DOCUMENT
+# ============================================================
+
+def process_document(file):
+
+    global all_chunks
+    global vector_store
+    global current_filename
+
+    if file is None:
+
+        return (
+            "",
+            "Please upload a document."
+        )
+
+    try:
+
+        file_path = file
+
+        current_filename = Path(
+            file_path
+        ).name
+
+        print(
+            f"Processing: {current_filename}"
+        )
+
+        documents = extract_document(
+            file_path
+        )
+
+        print(
+            f"Extracted documents: "
+            f"{len(documents)}"
+        )
+
+        if not documents:
+
+            return (
+                "",
+                "No readable text found."
+            )
+
+        all_chunks = create_chunks(
+            documents
+        )
+
+        print(
+            f"Created chunks: "
+            f"{len(all_chunks)}"
+        )
+
+        embeddings = load_embeddings()
+
+        print(
+            f"Creating FAISS index for "
+            f"{len(all_chunks)} chunks..."
+        )
+
+        vector_store = FAISS.from_documents(
+            all_chunks,
+            embeddings
+        )
+
+        build_bm25(
+            all_chunks
+        )
+
+        print(
+            "Document ready."
+        )
+
+        return (
+            "ready",
+            f"✓ {current_filename} is ready"
+        )
+
+    except Exception as e:
+
+        print(
+            f"PROCESS ERROR: {repr(e)}"
+        )
+
+        return (
+            "",
+            f"Error: {str(e)}"
+        )
+
+
+# ============================================================
+# QUERY INTENT
+# ============================================================
+
+def detect_intent(query: str) -> str:
+
+    q = query.lower().strip()
+
+    if any(
+        word in q
+        for word in [
+            "skill",
+            "skills",
+            "technology",
+            "technologies",
+            "programming language",
+            "tools",
+            "technical"
+        ]
+    ):
+        return "skills"
+
+    if any(
+        word in q
+        for word in [
+            "education",
+            "degree",
+            "college",
+            "university",
+            "qualification"
+        ]
+    ):
+        return "education"
+
+    if any(
+        word in q
+        for word in [
+            "experience",
+            "work experience",
+            "employment",
+            "worked"
+        ]
+    ):
+        return "experience"
+
+    if any(
+        word in q
+        for word in [
+            "project",
+            "projects"
+        ]
+    ):
+        return "projects"
+
+    if any(
+        word in q
+        for word in [
+            "contact",
+            "email",
+            "phone",
+            "mobile"
+        ]
+    ):
+        return "contact"
+
+    return "general"
+
+
+# ============================================================
+# QUERY EXPANSION
+# ============================================================
+
+def expand_query(query: str) -> List[str]:
+
+    intent = detect_intent(query)
+
+    queries = [query]
+
+    if intent == "skills":
+
+        queries.extend([
+            "technical skills",
+            "programming languages",
+            "technologies",
+            "tools",
+            "technical expertise"
+        ])
+
+    elif intent == "education":
+
+        queries.extend([
+            "education",
+            "degree",
+            "university",
+            "college",
+            "qualification"
+        ])
+
+    elif intent == "experience":
+
+        queries.extend([
+            "work experience",
+            "professional experience",
+            "employment",
+            "career"
+        ])
+
+    elif intent == "projects":
+
+        queries.extend([
+            "projects",
+            "project experience",
+            "projects developed"
+        ])
+
+    return queries
+
+
+# ============================================================
+# KEYWORD SCORE
+# ============================================================
+
+def keyword_score(
+    query: str,
+    text: str
+) -> float:
+
+    query_words = set(
+        re.findall(
+            r"\b\w+\b",
+            query.lower()
+        )
+    )
+
+    text_words = set(
+        re.findall(
+            r"\b\w+\b",
+            text.lower()
+        )
+    )
+
+    if not query_words:
+
+        return 0.0
+
+    overlap = (
+        query_words.intersection(
+            text_words
+        )
+    )
+
+    return len(overlap) / len(query_words)
+
+
+# ============================================================
+# INTENT SCORE
+# ============================================================
+
+def intent_score(
+    query: str,
+    text: str
+) -> float:
+
+    intent = detect_intent(query)
+
+    text_lower = text.lower()
+
+    if intent == "skills":
+
+        terms = [
+            "technical skills",
+            "programming languages",
+            "technologies",
+            "tools",
+            "skills",
+            "python",
+            "sql",
+            "mongodb"
+        ]
+
+    elif intent == "education":
+
+        terms = [
+            "education",
+            "degree",
+            "university",
+            "college",
+            "qualification"
+        ]
+
+    elif intent == "experience":
+
+        terms = [
+            "experience",
+            "employment",
+            "worked",
+            "professional"
+        ]
+
+    elif intent == "projects":
+
+        terms = [
+            "project",
+            "projects",
+            "developed"
+        ]
+
+    elif intent == "contact":
+
+        terms = [
+            "email",
+            "phone",
+            "mobile",
+            "contact"
+        ]
+
+    else:
+
+        terms = []
+
+    if not terms:
+
+        return 0.0
+
+    matches = sum(
+        1
+        for term in terms
+        if term in text_lower
+    )
+
+    return matches / len(terms)
+
+
+# ============================================================
+# RETRIEVAL
+# ============================================================
+
+def retrieve_documents(
+    query: str,
+    k: int = FINAL_TOP_K
+) -> List[Document]:
+
+    if vector_store is None:
+
+        return []
+
+    embeddings = load_embeddings()
+
+    # --------------------------------------------------------
+    # Semantic retrieval
+    # --------------------------------------------------------
+
+    semantic_results = []
+
+    expanded_queries = expand_query(
+        query
+    )
+
+    for expanded_query in expanded_queries:
+
+        try:
+
+            results = vector_store.similarity_search(
+                expanded_query,
+                k=SEMANTIC_TOP_K
+            )
+
+            semantic_results.extend(
+                results
+            )
+
+        except Exception as e:
+
+            print(
+                f"Semantic search error: "
+                f"{repr(e)}"
+            )
+
+    # --------------------------------------------------------
+    # BM25 retrieval
+    # --------------------------------------------------------
+
+    bm25_results = []
+
+    if bm25 is not None:
+
+        query_tokens = query.lower().split()
+
+        scores = bm25.get_scores(
+            query_tokens
+        )
+
+        ranked_indices = sorted(
+            range(len(scores)),
+            key=lambda i: scores[i],
+            reverse=True
+        )[:BM25_TOP_K]
+
+        bm25_results = [
+            all_chunks[i]
+            for i in ranked_indices
+        ]
+
+    # --------------------------------------------------------
+    # Unique candidate documents
+    # --------------------------------------------------------
+
+    candidates = []
+
+    seen = set()
+
+    for doc in (
+        semantic_results +
+        bm25_results
+    ):
+
+        text = doc.page_content
+
+        if text not in seen:
+
+            seen.add(text)
+
+            candidates.append(doc)
+
+    # --------------------------------------------------------
+    # Score candidates
+    # --------------------------------------------------------
+
+    scored = []
+
+    semantic_texts = [
+        doc.page_content
+        for doc in semantic_results
+    ]
+
+    for doc in candidates:
+
+        text = doc.page_content
+
+        semantic = 0.0
+
+        if text in semantic_texts:
+
+            semantic = 1.0
+
+        bm25_value = 0.0
+
+        if bm25 is not None:
+
+            try:
+
+                index = all_chunks.index(
+                    doc
+                )
+
+                query_tokens = (
+                    query.lower().split()
+                )
+
+                scores = bm25.get_scores(
+                    query_tokens
+                )
+
+                maximum = max(scores)
+
+                if maximum > 0:
+
+                    bm25_value = (
+                        scores[index] /
+                        maximum
+                    )
+
+            except Exception:
+
+                bm25_value = 0.0
+
+        keyword = keyword_score(
+            query,
+            text
+        )
+
+        intent = intent_score(
+            query,
+            text
+        )
+
+        score = (
+            semantic * 1.0
+            + bm25_value * 1.5
+            + keyword * 2.0
+            + intent * 5.0
+        )
+
+        scored.append(
+            (
+                score,
+                doc
+            )
+        )
+
+    scored.sort(
+        key=lambda x: x[0],
+        reverse=True
+    )
+
+    if scored:
+
+        print(
+            f"RETRIEVAL SCORE: "
+            f"{scored[0][0]:.3f}"
+        )
+
+        print(
+            scored[0][1].page_content[
+                :500
+            ]
+        )
+
+    final_documents = [
+        item[1]
+        for item in scored[:k]
+    ]
+
+    print(
+        f"FINAL RETRIEVED CHUNKS: "
+        f"{len(final_documents)}"
+    )
+
+    return final_documents
+
+
+# ============================================================
+# BROAD QUERY DETECTION
+# ============================================================
+
+def is_broad_query(
+    query: str
+) -> bool:
+
+    q = query.lower().strip()
+
+    broad_phrases = [
+        "tell me about this document",
+        "tell me about the document",
+        "summarize this document",
+        "summarize the document",
+        "give me a summary",
+        "what is this document about",
+        "what does this document contain",
+        "overview",
+        "summarize"
+    ]
+
+    return any(
+        phrase in q
+        for phrase in broad_phrases
+    )
+
+
+# ============================================================
+# OVERVIEW RETRIEVAL
+# ============================================================
+
+def get_overview_documents():
+
+    if not all_chunks:
+
+        return []
+
+    return all_chunks[:FINAL_TOP_K]
+
+
+# ============================================================
+# DIRECT SECTION EXTRACTION
+# ============================================================
+
+def extract_section_answer(
+    query: str
+) -> str:
+
+    intent = detect_intent(
+        query
+    )
+
+    if intent not in [
+        "skills",
+        "education",
+        "experience",
+        "projects",
+        "contact"
+    ]:
+
+        return ""
+
+    heading_map = {
+
+        "skills": [
+            "technical skills",
+            "skills",
+            "technical expertise",
+            "programming languages",
+            "technologies",
+            "tools",
+            "tools and technologies"
+        ],
+
+        "education": [
+            "education",
+            "academic background",
+            "qualification"
+        ],
+
+        "experience": [
+            "experience",
+            "work experience",
+            "professional experience"
+        ],
+
+        "projects": [
+            "projects",
+            "project experience"
+        ],
+
+        "contact": [
+            "contact",
+            "contact information"
+        ]
+    }
+
+    headings = heading_map[
+        intent
+    ]
+
+    for chunk in all_chunks:
+
+        lines = (
+            chunk.page_content
+            .splitlines()
+        )
+
+        for i, line in enumerate(lines):
+
+            normalized = (
+                line.strip()
+                .lower()
+                .rstrip(":")
+            )
+
+            if normalized in headings:
+
+                collected = []
+
+                # ------------------------------------------------
+                # Inline content after heading
+                # ------------------------------------------------
+
+                original = line.strip()
+
+                if ":" in original:
+
+                    remainder = (
+                        original.split(
+                            ":",
+                            1
+                        )[1].strip()
+                    )
+
+                    if remainder:
+
+                        collected.append(
+                            remainder
+                        )
+
+                # ------------------------------------------------
+                # Following lines
+                # ------------------------------------------------
+
+                for next_line in lines[
+                    i + 1:
+                ]:
+
+                    clean = next_line.strip()
+
+                    if not clean:
+
+                        continue
+
+                    lower = clean.lower()
+
+                    # Stop at another section heading
+                    if (
+                        clean.isupper()
+                        and len(clean) < 80
+                    ):
+
+                        break
+
+                    if any(
+                        lower.startswith(
+                            heading + ":"
+                        )
+                        for heading in [
+                            "education",
+                            "experience",
+                            "projects",
+                            "certifications",
+                            "achievements",
+                            "contact",
+                            "summary",
+                            "objective"
+                        ]
+                    ):
+
+                        break
+
+                    collected.append(
+                        clean
+                    )
+
+                if collected:
+
+                    answer = "\n".join(
+                        collected
+                    ).strip()
+
+                    if answer:
+
+                        return answer
+
+    return ""
+
+
+# ============================================================
+# ANSWER GENERATION
+# ============================================================
+
+def generate_answer(
+    query: str,
+    documents: List[Document]
+) -> str:
+
+    # --------------------------------------------------------
+    # Direct section answer
+    # --------------------------------------------------------
+
+    direct_answer = (
+        extract_section_answer(
+            query
+        )
+    )
+
+    if direct_answer:
+
+        return direct_answer
+
+    # --------------------------------------------------------
+    # No retrieved information
+    # --------------------------------------------------------
+
+    if not documents:
+
+        return (
+            "I couldn't find that "
+            "information in the uploaded "
+            "document."
+        )
+
+    # --------------------------------------------------------
+    # Build context
+    # --------------------------------------------------------
+
+    context_parts = []
+
+    for doc in documents:
+
+        context_parts.append(
+            doc.page_content
+        )
+
+    context = "\n\n".join(
+        context_parts
+    )
+
+    # Keep prompt reasonably small
+    context = context[:6000]
+
+    # --------------------------------------------------------
+    # Prompt
+    # --------------------------------------------------------
+
+    prompt = f"""
+You are DocFinder AI, a document question-answering assistant.
+
+Answer the user's question using ONLY the information in the
+uploaded document context below.
+
+Do not use outside knowledge.
+
+If the answer is not present in the context, say:
+
+I couldn't find that information in the uploaded document.
+
+Be concise and directly answer the question.
+
+DOCUMENT CONTEXT:
+{context}
+
+USER QUESTION:
+{query}
+
+ANSWER:
+"""
+
+    try:
+
+        result = run_llm(
+            prompt
+        )
+
+        answer = result
+
+        if not answer:
+
+            return (
+                "I couldn't find that "
+                "information in the uploaded "
+                "document."
+            )
+
+        return answer.strip()
+
+    except Exception as e:
+
+        print(
+            f"LLM ERROR: {repr(e)}"
+        )
+
+        return (
+            f"Error: {str(e)}"
+        )
+
+
+# ============================================================
+# SOURCE CREATION
+# ============================================================
+
+def create_sources(
+    documents: List[Document]
+) -> str:
+
+    if not documents:
+
+        return ""
+
+    cards = []
+
+    for index, doc in enumerate(
+        documents,
+        start=1
+    ):
+
+        page = doc.metadata.get(
+            "page",
+            "N/A"
+        )
+
+        preview = (
+            doc.page_content
+            .replace("\n", " ")
+            .strip()
+        )
+
+        if len(preview) > 220:
+
+            preview = (
+                preview[:220] +
+                "..."
+            )
+
+        cards.append(
+            f"""
+            <div class="source-card">
+                <div class="source-number">
+                    Source {index}
+                </div>
+
+                <div class="source-page">
+                    Page {page}
+                </div>
+
+                <div class="source-preview">
+                    {preview}
+                </div>
+            </div>
+            """
+        )
+
+    return f"""
+    <div class="sources-wrapper">
+
+        <div class="sources-title">
+            Sources
+        </div>
+
+        {''.join(cards)}
+
+    </div>
+    """
+
+
+# ============================================================
+# SEARCH LOADER
 # ============================================================
 
 LOADER_HTML = """
@@ -115,1858 +1296,44 @@ PROCESS_LOADER_HTML = """
 
 
 # ============================================================
-# CSS
+# SEARCH FUNCTION
 # ============================================================
 
-CSS = """
-
-/* ==========================================================
-   GLOBAL
-   ========================================================== */
-
-body {
-    background:
-        radial-gradient(
-            circle at 50% 0%,
-            rgba(55, 65, 120, 0.14),
-            transparent 38%
-        ),
-        #0b0b0d !important;
-}
-
-.gradio-container {
-    max-width: 1400px !important;
-    margin: 0 auto !important;
-    padding: 24px 28px !important;
-    background: transparent !important;
-}
-
-
-/* ==========================================================
-   HEADER
-   ========================================================== */
-
-.app-header {
-    text-align: center;
-    margin-bottom: 28px;
-}
-
-.app-title {
-    font-size: 42px;
-    font-weight: 800;
-    letter-spacing: -1px;
-    color: #91b2ff;
-    margin: 0;
-}
-
-.app-subtitle {
-    margin-top: 8px;
-    font-size: 18px;
-    color: #9aa9ca;
-}
-
-
-/* ==========================================================
-   MAIN CARD
-   ========================================================== */
-
-.glass-card {
-    background:
-        linear-gradient(
-            145deg,
-            rgba(19, 25, 50, 0.97),
-            rgba(13, 18, 38, 0.97)
-        );
-
-    border: 1px solid rgba(91, 125, 230, 0.38);
-
-    border-radius: 30px;
-
-    padding: 50px;
-
-    box-shadow:
-        0 25px 70px rgba(0, 0, 0, 0.30),
-        inset 0 1px 0 rgba(255, 255, 255, 0.025);
-
-    min-height: 600px;
-}
-
-
-/* ==========================================================
-   HEADINGS
-   ========================================================== */
-
-.section-title {
-    color: #f2f4ff;
-    font-size: 29px;
-    font-weight: 800;
-    margin-bottom: 8px;
-}
-
-.section-subtitle {
-    color: #9caacd;
-    font-size: 17px;
-    margin-bottom: 30px;
-}
-
-
-/* ==========================================================
-   QUESTION BOX
-   ========================================================== */
-
-.question-box textarea,
-.question-box input {
-    background: #29292b !important;
-
-    border: 2px solid #45464d !important;
-
-    border-radius: 10px !important;
-
-    color: #f2f4ff !important;
-
-    font-size: 17px !important;
-
-    padding: 15px !important;
-
-    box-shadow: none !important;
-}
-
-.question-box textarea:focus,
-.question-box input:focus {
-    border-color: #5d75bd !important;
-
-    box-shadow:
-        0 0 0 1px
-        rgba(93, 117, 189, 0.2) !important;
-}
-
-.enter-hint {
-    color: #94a4c9;
-    font-size: 14px;
-    margin-top: 8px;
-}
-
-
-/* ==========================================================
-   ANSWER
-   ========================================================== */
-
-.answer-card {
-    background:
-        rgba(15, 25, 60, 0.82);
-
-    border:
-        1px solid
-        rgba(79, 123, 232, 0.55);
-
-    border-radius: 24px;
-
-    padding: 28px;
-
-    margin-top: 28px;
-
-    color: #eef2ff;
-
-    line-height: 1.75;
-
-    font-size: 18px;
-}
-
-.answer-heading {
-    color: #8fb1ff;
-
-    font-size: 19px;
-
-    font-weight: 800;
-
-    margin-bottom: 14px;
-}
-
-.answer-text {
-    color: #e9edff;
-
-    white-space: pre-wrap;
-}
-
-
-/* ==========================================================
-   SOURCES
-   ========================================================== */
-
-.sources-title {
-    color: #f0f2ff;
-
-    font-size: 17px;
-
-    font-weight: 800;
-
-    margin-top: 34px;
-
-    margin-bottom: 12px;
-}
-
-.source-card {
-    background:
-        rgba(29, 34, 55, 0.80);
-
-    border:
-        1px solid
-        rgba(96, 110, 150, 0.32);
-
-    border-radius: 14px;
-
-    padding: 14px 16px;
-
-    margin-bottom: 10px;
-}
-
-.source-number {
-    color: #8fb1ff;
-
-    font-weight: 800;
-}
-
-.source-text {
-    color: #b9c3dd;
-
-    font-size: 14px;
-
-    line-height: 1.55;
-}
-
-
-/* ==========================================================
-   STATUS
-   ========================================================== */
-
-.status-text {
-    text-align: center;
-
-    color: #8faeff;
-
-    font-size: 14px;
-
-    margin-top: 16px;
-}
-
-
-/* ==========================================================
-   8-DOT LOADER
-   ========================================================== */
-
-.loader-area {
-    width: 100%;
-
-    height: 155px;
-
-    display: flex;
-
-    flex-direction: column;
-
-    align-items: center;
-
-    justify-content: center;
-
-    margin: 5px 0;
-}
-
-
-/*
-   IMPORTANT:
-   The dots are positioned using rotate + translateY.
-   The animation changes ONLY opacity.
-   Therefore the dots will no longer collapse
-   into the center.
-*/
-
-.circle-loader {
-    width: 82px;
-
-    height: 82px;
-
-    position: relative;
-
-    animation:
-        loader-rotate
-        1.8s
-        linear
-        infinite;
-}
-
-.circle-loader span {
-    position: absolute;
-
-    width: 13px;
-
-    height: 13px;
-
-    border-radius: 50%;
-
-    background: #9a9a9a;
-
-    left: 34.5px;
-
-    top: 34.5px;
-
-    transform:
-        rotate(var(--angle))
-        translateY(-32px);
-
-    transform-origin:
-        6.5px 6.5px;
-
-    opacity: 0.25;
-
-    animation:
-        loader-fade
-        1.4s
-        ease-in-out
-        infinite;
-}
-
-.circle-loader span:nth-child(1) {
-    animation-delay: 0s;
-}
-
-.circle-loader span:nth-child(2) {
-    animation-delay: 0.175s;
-}
-
-.circle-loader span:nth-child(3) {
-    animation-delay: 0.35s;
-}
-
-.circle-loader span:nth-child(4) {
-    animation-delay: 0.525s;
-}
-
-.circle-loader span:nth-child(5) {
-    animation-delay: 0.70s;
-}
-
-.circle-loader span:nth-child(6) {
-    animation-delay: 0.875s;
-}
-
-.circle-loader span:nth-child(7) {
-    animation-delay: 1.05s;
-}
-
-.circle-loader span:nth-child(8) {
-    animation-delay: 1.225s;
-}
-
-
-@keyframes loader-fade {
-
-    0% {
-        opacity: 0.18;
-    }
-
-    50% {
-        opacity: 1;
-    }
-
-    100% {
-        opacity: 0.18;
-    }
-}
-
-
-@keyframes loader-rotate {
-
-    from {
-        transform: rotate(0deg);
-    }
-
-    to {
-        transform: rotate(360deg);
-    }
-}
-
-
-.loader-text {
-    color: #9a9a9a;
-
-    font-size: 14px;
-
-    margin-top: 14px;
-}
-
-
-/* ==========================================================
-   FEATURES
-   ========================================================== */
-
-.feature-grid {
-    display: grid;
-
-    grid-template-columns:
-        repeat(3, 1fr);
-
-    gap: 15px;
-
-    margin-top: 30px;
-}
-
-.feature-card {
-    background:
-        rgba(26, 32, 55, 0.7);
-
-    border:
-        1px solid
-        rgba(88, 108, 160, 0.25);
-
-    border-radius: 18px;
-
-    padding: 20px;
-
-    text-align: center;
-}
-
-.feature-title {
-    color: #dfe6ff;
-
-    font-weight: 700;
-
-    margin-bottom: 6px;
-}
-
-.feature-text {
-    color: #8f9dbc;
-
-    font-size: 13px;
-}
-
-
-/* ==========================================================
-   BUTTONS
-   ========================================================== */
-
-.primary-button {
-    border-radius: 16px !important;
-
-    min-height: 52px !important;
-
-    font-weight: 700 !important;
-}
-
-.reset-button {
-    width: 100%;
-
-    min-height: 54px !important;
-
-    margin-top: 34px;
-
-    border-radius: 18px !important;
-
-    background:
-        rgba(35, 40, 60, 0.72) !important;
-
-    border:
-        1px solid
-        rgba(100, 112, 150, 0.35) !important;
-
-    color: #eef1ff !important;
-
-    font-size: 18px !important;
-
-    font-weight: 700 !important;
-}
-
-
-/* ==========================================================
-   MOBILE
-   ========================================================== */
-
-@media (max-width: 900px) {
-
-    .gradio-container {
-        padding: 16px !important;
-    }
-
-    .glass-card {
-        padding: 30px 24px;
-
-        border-radius: 24px;
-    }
-
-    .app-title {
-        font-size: 34px;
-    }
-
-    .feature-grid {
-        grid-template-columns: 1fr;
-    }
-}
-
-@media (max-width: 600px) {
-
-    .gradio-container {
-        padding: 10px !important;
-    }
-
-    .glass-card {
-        padding: 22px 16px;
-
-        border-radius: 20px;
-    }
-
-    .app-title {
-        font-size: 28px;
-    }
-
-    .app-subtitle {
-        font-size: 15px;
-    }
-
-    .section-title {
-        font-size: 24px;
-    }
-
-    .answer-card {
-        padding: 20px;
-
-        font-size: 16px;
-    }
-}
-
-@media (max-width: 380px) {
-
-    .app-title {
-        font-size: 24px;
-    }
-
-    .glass-card {
-        padding: 18px 12px;
-    }
-}
-
-"""
-
-
-# ============================================================
-# DOCUMENT EXTRACTION
-# ============================================================
-
-def extract_pdf(path: str) -> List[Document]:
-
-    documents = []
-
-    pdf = pymupdf.open(path)
-
-    for page_number, page in enumerate(pdf):
-
-        text = page.get_text("text").strip()
-
-        # Normal text PDF
-        if len(text) >= 30:
-
-            documents.append(
-                Document(
-                    page_content=text,
-                    metadata={
-                        "source": Path(path).name,
-                        "page": page_number + 1,
-                        "method": "text"
-                    }
-                )
-            )
-
-        else:
-
-            # OCR for scanned pages
-            pix = page.get_pixmap(
-                matrix=pymupdf.Matrix(
-                    1.7,
-                    1.7
-                ),
-                alpha=False
-            )
-
-            img = Image.frombytes(
-                "RGB",
-                [pix.width, pix.height],
-                pix.samples
-            )
-
-            ocr_text = (
-                pytesseract
-                .image_to_string(img)
-                .strip()
-            )
-
-            if ocr_text:
-
-                documents.append(
-                    Document(
-                        page_content=ocr_text,
-                        metadata={
-                            "source": Path(path).name,
-                            "page": page_number + 1,
-                            "method": "ocr"
-                        }
-                    )
-                )
-
-    pdf.close()
-
-    return documents
-
-
-def extract_docx(path: str) -> List[Document]:
-
-    doc = DocxDocument(path)
-
-    paragraphs = []
-
-    for paragraph in doc.paragraphs:
-
-        text = paragraph.text.strip()
-
-        if text:
-
-            paragraphs.append(text)
-
-    text = "\n".join(paragraphs)
-
-    if not text:
-
-        return []
-
-    return [
-        Document(
-            page_content=text,
-            metadata={
-                "source": Path(path).name,
-                "page": 1,
-                "method": "docx"
-            }
-        )
-    ]
-
-
-def extract_txt(path: str) -> List[Document]:
-
-    with open(
-        path,
-        "r",
-        encoding="utf-8",
-        errors="ignore"
-    ) as f:
-
-        text = f.read().strip()
-
-    if not text:
-
-        return []
-
-    return [
-        Document(
-            page_content=text,
-            metadata={
-                "source": Path(path).name,
-                "page": 1,
-                "method": "text"
-            }
-        )
-    ]
-
-
-def extract_document(path: str) -> List[Document]:
-
-    extension = Path(path).suffix.lower()
-
-    if extension == ".pdf":
-        return extract_pdf(path)
-
-    if extension == ".docx":
-        return extract_docx(path)
-
-    if extension == ".txt":
-        return extract_txt(path)
-
-    raise ValueError(
-        "Unsupported file type. "
-        "Use PDF, DOCX or TXT."
-    )
-
-
-# ============================================================
-# CHUNKING
-# ============================================================
-
-def split_documents(
-    documents: List[Document]
-) -> List[Document]:
-
-    splitter = RecursiveCharacterTextSplitter(
-
-        chunk_size=CHUNK_SIZE,
-
-        chunk_overlap=CHUNK_OVERLAP,
-
-        separators=[
-            "\n\n",
-            "\n",
-            ". ",
-            ": ",
-            ", ",
-            " ",
-            ""
-        ]
-    )
-
-    chunks = splitter.split_documents(
-        documents
-    )
-
-    cleaned = []
-
-    for chunk in chunks:
-
-        text = chunk.page_content.strip()
-
-        if len(text) >= 25:
-
-            cleaned.append(
-                Document(
-                    page_content=text,
-                    metadata=chunk.metadata
-                )
-            )
-
-    return cleaned
-
-
-# ============================================================
-# EMBEDDINGS
-# ============================================================
-
-def load_embeddings():
-
-    global embedding_model
-
-    if embedding_model is None:
-
-        print("Loading embedding model...")
-
-        embedding_model = (
-            HuggingFaceEmbeddings(
-                model_name=EMBEDDING_MODEL,
-
-                model_kwargs={
-                    "device": "cpu"
-                },
-
-                encode_kwargs={
-                    "normalize_embeddings": True
-                }
-            )
-        )
-
-        print("Embedding model loaded.")
-
-    return embedding_model
-
-
-def build_faiss(
-    chunks: List[Document]
+def search_document(
+    query: str
 ):
-
-    embeddings = load_embeddings()
-
-    print(
-        f"Creating FAISS index "
-        f"for {len(chunks)} chunks..."
-    )
-
-    return FAISS.from_documents(
-        chunks,
-        embeddings
-    )
-
-
-# ============================================================
-# BM25
-# ============================================================
-
-def tokenize(text: str) -> List[str]:
-
-    return re.findall(
-        r"\b[a-zA-Z0-9+#.\-]+\b",
-        text.lower()
-    )
-
-
-def build_bm25(
-    chunks: List[Document]
-):
-
-    corpus = [
-        tokenize(chunk.page_content)
-        for chunk in chunks
-    ]
-
-    return BM25Okapi(corpus)
-
-
-def bm25_search(
-    query: str,
-    k: int = BM25_TOP_K
-) -> List[Document]:
-
-    if bm25 is None:
-        return []
-
-    scores = bm25.get_scores(
-        tokenize(query)
-    )
-
-    indices = sorted(
-        range(len(scores)),
-        key=lambda i: scores[i],
-        reverse=True
-    )
-
-    results = []
-
-    for index in indices[:k]:
-
-        if scores[index] <= 0:
-            continue
-
-        results.append(
-            all_chunks[index]
-        )
-
-    return results
-
-
-# ============================================================
-# LLM
-# ============================================================
-
-
-def load_llm():
-
-    global llm
-
-    if llm is None:
-
-        print("Loading Qwen 0.5B...")
-
-        llm = pipeline(
-            "text-generation",
-            model=LLM_MODEL,
-            tokenizer=LLM_MODEL,
-            max_new_tokens=MAX_NEW_TOKENS,
-            do_sample=False,
-            return_full_text=False
-        )
-
-        print("Qwen loaded.")
-
-    return llm
-
-# ============================================================
-# INTENT
-# ============================================================
-
-def normalize_query(
-    query: str
-) -> str:
-
-    query = query.lower().strip()
-
-    return re.sub(
-        r"\s+",
-        " ",
-        query
-    )
-
-
-def detect_intent(
-    query: str
-) -> str:
-
-    q = normalize_query(query)
-
-    if any(
-        x in q
-        for x in [
-            "skill",
-            "skills",
-            "technical skill",
-            "technical skills",
-            "programming language",
-            "programming languages",
-            "technology",
-            "technologies",
-            "tech stack",
-            "tools"
-        ]
-    ):
-        return "skills"
-
-    if any(
-        x in q
-        for x in [
-            "education",
-            "degree",
-            "college",
-            "university",
-            "qualification",
-            "academic"
-        ]
-    ):
-        return "education"
-
-    if any(
-        x in q
-        for x in [
-            "experience",
-            "work experience",
-            "professional experience",
-            "employment",
-            "job"
-        ]
-    ):
-        return "experience"
-
-    if any(
-        x in q
-        for x in [
-            "project",
-            "projects",
-            "developed",
-            "built",
-            "application"
-        ]
-    ):
-        return "projects"
-
-    if any(
-        x in q
-        for x in [
-            "email",
-            "phone",
-            "mobile",
-            "linkedin",
-            "github",
-            "contact"
-        ]
-    ):
-        return "contact"
-
-    return "general"
-
-
-def expand_query(
-    query: str
-) -> List[str]:
-
-    intent = detect_intent(query)
-
-    q = normalize_query(query)
-
-    variants = [q]
-
-    if intent == "skills":
-
-        variants += [
-            "skills",
-            "technical skills",
-            "technical expertise",
-            "programming languages",
-            "technologies",
-            "tools and technologies",
-            "technical skills programming languages technologies"
-        ]
-
-    elif intent == "education":
-
-        variants += [
-            "education",
-            "educational qualification",
-            "degree",
-            "university",
-            "college"
-        ]
-
-    elif intent == "experience":
-
-        variants += [
-            "work experience",
-            "professional experience",
-            "employment",
-            "job experience"
-        ]
-
-    elif intent == "projects":
-
-        variants += [
-            "projects",
-            "technical projects",
-            "projects developed",
-            "applications developed"
-        ]
-
-    elif intent == "contact":
-
-        variants += [
-            "contact information",
-            "email",
-            "phone",
-            "linkedin",
-            "github"
-        ]
-
-    # Remove duplicates
-    return list(dict.fromkeys(variants))
-
-
-# ============================================================
-# INTENT TERMS
-# ============================================================
-
-INTENT_TERMS = {
-
-    "skills": [
-        "skills",
-        "technical skills",
-        "programming",
-        "programming languages",
-        "technologies",
-        "technology",
-        "tools",
-        "frameworks",
-        "databases",
-        "technical expertise"
-    ],
-
-    "education": [
-        "education",
-        "degree",
-        "university",
-        "college",
-        "qualification",
-        "academic"
-    ],
-
-    "experience": [
-        "experience",
-        "work experience",
-        "professional experience",
-        "employment",
-        "company",
-        "role"
-    ],
-
-    "projects": [
-        "project",
-        "projects",
-        "developed",
-        "built",
-        "application"
-    ],
-
-    "contact": [
-        "email",
-        "phone",
-        "mobile",
-        "linkedin",
-        "github",
-        "contact"
-    ],
-
-    "general": []
-}
-
-
-def keyword_score(
-    text: str,
-    terms: List[str]
-) -> float:
-
-    text_lower = text.lower()
-
-    score = 0.0
-
-    for term in terms:
-
-        if term.lower() in text_lower:
-
-            if len(term.split()) > 1:
-                score += 4.0
-            else:
-                score += 2.0
-
-    return score
-
-
-# ============================================================
-# SEMANTIC SEARCH
-# ============================================================
-
-def semantic_search(
-    query: str,
-    k: int = SEMANTIC_TOP_K
-) -> List[Document]:
-
-    if vector_store is None:
-        return []
-
-    return vector_store.similarity_search(
-        query,
-        k=k
-    )
-
-
-# ============================================================
-# RETRIEVAL
-# ============================================================
-
-def retrieve_documents(
-    query: str
-) -> List[Document]:
-
-    if not all_chunks:
-        return []
-
-    intent = detect_intent(query)
-
-    variants = expand_query(query)
-
-    candidates: Dict[str, Dict] = {}
-
-    # --------------------------------------------------------
-    # Semantic
-    # --------------------------------------------------------
-
-    for variant in variants:
-
-        results = semantic_search(
-            variant,
-            SEMANTIC_TOP_K
-        )
-
-        for rank, doc in enumerate(results):
-
-            key = doc.page_content.strip()
-
-            if key not in candidates:
-
-                candidates[key] = {
-                    "doc": doc,
-                    "semantic": 0.0,
-                    "bm25": 0.0,
-                    "keyword": 0.0,
-                    "intent": 0.0
-                }
-
-            candidates[key]["semantic"] += (
-                1.0 / (rank + 1)
-            )
-
-    # --------------------------------------------------------
-    # BM25
-    # --------------------------------------------------------
-
-    for variant in variants:
-
-        results = bm25_search(
-            variant,
-            BM25_TOP_K
-        )
-
-        for rank, doc in enumerate(results):
-
-            key = doc.page_content.strip()
-
-            if key not in candidates:
-
-                candidates[key] = {
-                    "doc": doc,
-                    "semantic": 0.0,
-                    "bm25": 0.0,
-                    "keyword": 0.0,
-                    "intent": 0.0
-                }
-
-            candidates[key]["bm25"] += (
-                1.0 / (rank + 1)
-            )
-
-    # --------------------------------------------------------
-    # Intent scoring
-    # --------------------------------------------------------
-
-    intent_terms = INTENT_TERMS.get(
-        intent,
-        []
-    )
-
-    query_terms = tokenize(query)
-
-    for item in candidates.values():
-
-        text = item["doc"].page_content
-
-        item["keyword"] = keyword_score(
-            text,
-            query_terms
-        )
-
-        item["intent"] = keyword_score(
-            text,
-            intent_terms
-        )
-
-    # --------------------------------------------------------
-    # Final ranking
-    # --------------------------------------------------------
-
-    ranked = []
-
-    for item in candidates.values():
-
-        score = (
-            item["semantic"] * 1.0
-            +
-            item["bm25"] * 1.5
-            +
-            item["keyword"] * 2.0
-            +
-            item["intent"] * 5.0
-        )
-
-        ranked.append(
-            (
-                score,
-                item["doc"]
-            )
-        )
-
-    ranked.sort(
-        key=lambda x: x[0],
-        reverse=True
-    )
-
-    final_docs = []
-
-    seen = set()
-
-    for score, doc in ranked:
-
-        key = doc.page_content.strip()
-
-        if key in seen:
-            continue
-
-        seen.add(key)
-
-        final_docs.append(doc)
-
-        print(
-            f"\nRETRIEVAL SCORE: {score:.3f}"
-        )
-
-        print(
-            doc.page_content[:500]
-        )
-
-        if len(final_docs) >= FINAL_TOP_K:
-            break
-
-    return final_docs
-
-
-# ============================================================
-# DIRECT ANSWER EXTRACTION
-#
-# This is the important fix for questions such as:
-# "what are the skills?"
-# ============================================================
-
-def extract_section_answer(
-    query: str,
-    documents: List[Document]
-) -> str | None:
-
-    intent = detect_intent(query)
-
-    if intent == "general":
-        return None
-
-    if not documents:
-        return None
-
-    if intent == "skills":
-
-        heading_patterns = [
-            r"technical\s+skills?\s*:?\s*(.*)",
-            r"skills?\s*:?\s*(.*)",
-            r"technical\s+expertise\s*:?\s*(.*)",
-            r"programming\s+languages?\s*:?\s*(.*)",
-            r"technologies\s*:?\s*(.*)",
-            r"tools\s*(?:and\s+technologies)?\s*:?\s*(.*)"
-        ]
-
-        collected = []
-
-        for doc in documents:
-
-            text = doc.page_content.strip()
-
-            lines = [
-                line.strip()
-                for line in text.splitlines()
-                if line.strip()
-            ]
-
-            for i, line in enumerate(lines):
-
-                line_clean = re.sub(
-                    r"\s+",
-                    " ",
-                    line
-                ).strip()
-
-                # --------------------------------------------
-                # Inline section
-                # Example:
-                # Technical Skills: Python, SQL, MongoDB
-                # --------------------------------------------
-
-                for pattern in heading_patterns:
-
-                    match = re.search(
-                        pattern,
-                        line_clean,
-                        flags=re.IGNORECASE
-                    )
-
-                    if match:
-
-                        remainder = (
-                            match.group(1)
-                            .strip()
-                        )
-
-                        if remainder:
-
-                            collected.append(
-                                remainder
-                            )
-
-                        # Capture following list lines
-                        for next_line in lines[
-                            i + 1:i + 9
-                        ]:
-
-                            lower_next = (
-                                next_line.lower()
-                            )
-
-                            # Stop when another obvious
-                            # section begins.
-                            if re.match(
-                                r"^(education|"
-                                r"experience|"
-                                r"projects?|"
-                                r"certifications?|"
-                                r"summary|"
-                                r"objective|"
-                                r"contact)\b",
-                                lower_next
-                            ):
-                                break
-
-                            collected.append(
-                                next_line
-                            )
-
-                        break
-
-        # Remove duplicates
-        cleaned = []
-
-        for item in collected:
-
-            item = item.strip()
-
-            if (
-                item
-                and item not in cleaned
-            ):
-                cleaned.append(item)
-
-        if cleaned:
-
-            return "\n".join(
-                cleaned[:12]
-            )
-
-    # --------------------------------------------------------
-    # Other simple sections
-    # --------------------------------------------------------
-
-    if intent == "education":
-
-        patterns = [
-            r"education\s*:?\s*(.*)",
-            r"qualification\s*:?\s*(.*)",
-            r"academic\s*:?\s*(.*)"
-        ]
-
-        for doc in documents:
-
-            for line in doc.page_content.splitlines():
-
-                line = line.strip()
-
-                for pattern in patterns:
-
-                    match = re.search(
-                        pattern,
-                        line,
-                        flags=re.IGNORECASE
-                    )
-
-                    if match and match.group(1).strip():
-
-                        return match.group(1).strip()
-
-    return None
-
-
-# ============================================================
-# BROAD QUERY
-# ============================================================
-
-def is_broad_query(
-    query: str
-) -> bool:
-
-    q = normalize_query(query)
-
-    patterns = [
-        "tell me about this document",
-        "tell me about the document",
-        "summarize this document",
-        "summarize the document",
-        "summary of this document",
-        "what is this document about",
-        "give me an overview",
-        "overview of the document"
-    ]
-
-    return any(
-        p in q
-        for p in patterns
-    )
-
-
-def get_overview_documents():
-
-    if not all_chunks:
-        return []
-
-    if len(all_chunks) <= FINAL_TOP_K:
-        return all_chunks
-
-    indices = [
-        0,
-        len(all_chunks) // 3,
-        (2 * len(all_chunks)) // 3,
-        len(all_chunks) - 1
-    ]
-
-    result = []
-
-    seen = set()
-
-    for index in indices:
-
-        doc = all_chunks[index]
-
-        key = doc.page_content.strip()
-
-        if key not in seen:
-
-            result.append(doc)
-
-            seen.add(key)
-
-    return result[:FINAL_TOP_K]
-
-
-# ============================================================
-# CONTEXT
-# ============================================================
-
-def build_context(
-    documents: List[Document]
-) -> str:
-
-    parts = []
-
-    for i, doc in enumerate(
-        documents,
-        1
-    ):
-
-        page = doc.metadata.get(
-            "page",
-            "unknown"
-        )
-
-        parts.append(
-            f"""
-SOURCE {i}
-Page: {page}
-
-{doc.page_content}
-""".strip()
-        )
-
-    return (
-        "\n\n-------------------------\n\n"
-    ).join(parts)
-
-
-# ============================================================
-# LLM ANSWER
-# ============================================================
-
-@spaces.GPU(duration=15)
-def run_llm(prompt: str) -> str:
-
-    model = load_llm()
-
-    result = model(prompt)
-
-    if not result:
-        return ""
-
-    return result[0].get(
-        "generated_text",
-        ""
-    ).strip()
-def generate_answer(
-    query: str,
-    documents: List[Document]
-) -> str:
-
-    if not documents:
-
-        return (
-            "I couldn't find that information "
-            "in the uploaded document."
-        )
-
-    # --------------------------------------------------------
-    # First attempt deterministic extraction
-    # --------------------------------------------------------
-
-    direct_answer = extract_section_answer(
-        query,
-        documents
-    )
-
-    if direct_answer:
-
-        return direct_answer
-
-    # --------------------------------------------------------
-    # Otherwise use LLM
-    # --------------------------------------------------------
-
-    context = build_context(
-        documents
-    )
-
-    prompt = f"""
-You are DocFinder AI.
-
-Answer the question using ONLY the
-document context below.
-
-Question:
-{query}
-
-Document context:
-{context}
-
-Rules:
-
-- Do not use outside knowledge.
-- Do not guess.
-- Do not invent information.
-- Do not infer a skill from a project.
-- Do not infer a skill from GitHub.
-- Do not infer information from a job title.
-- If the answer is not explicitly present,
-  say exactly:
-
-"I couldn't find that information in the uploaded document."
-
-Give a concise answer.
-
-Answer:
-"""
-
-    result = run_llm(prompt)
-
-    if not result:
-
-        return (
-            "I couldn't find that information "
-            "in the uploaded document."
-        )
-
-    answer = result
-
-    answer = re.sub(
-        r"^(answer|response)\s*:\s*",
-        "",
-        answer,
-        flags=re.IGNORECASE
-    ).strip()
-
-    if not answer:
-
-        return (
-            "I couldn't find that information "
-            "in the uploaded document."
-        )
-
-    return answer
-
-# ============================================================
-# SOURCES
-# ============================================================
-
-def create_sources(
-    documents: List[Document]
-) -> str:
-
-    if not documents:
-        return ""
-
-    html = ""
-
-    for index, doc in enumerate(
-        documents,
-        1
-    ):
-
-        page = doc.metadata.get(
-            "page",
-            "unknown"
-        )
-
-        text = doc.page_content.strip()
-
-        preview = text[:300]
-
-        if len(text) > 300:
-            preview += "..."
-
-        preview = (
-            preview
-            .replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-        )
-
-        html += f"""
-        <div class="source-card">
-
-            <div>
-                <span class="source-number">
-                    Source {index}
-                </span>
-
-                &nbsp; • &nbsp;
-
-                Page {page}
-            </div>
-
-            <div class="source-text">
-                {preview}
-            </div>
-
-        </div>
-        """
-
-    return html
-
-
-# ============================================================
-# PROCESS DOCUMENT
-# ============================================================
-
-def process_document(file):
-
-    global all_chunks
-    global vector_store
-    global bm25
-    global current_filename
-
-    if file is None:
-
-        yield (
-            gr.update(visible=True),
-            gr.update(visible=False),
-            gr.update(visible=False),
-            "⚠️ Please upload a document first."
-        )
-
-        return
-
-    # SHOW LOADER IMMEDIATELY
-    yield (
-        gr.update(visible=True),
-        gr.update(visible=False),
-        gr.update(
-            value=PROCESS_LOADER_HTML,
-            visible=True
-        ),
-        ""
-    )
-
-    try:
-
-        current_filename = Path(
-            file.name
-        ).name
-
-        print(
-            f"\nProcessing: {current_filename}"
-        )
-
-        # Extract
-        documents = extract_document(
-            file.name
-        )
-
-        if not documents:
-
-            yield (
-                gr.update(visible=True),
-                gr.update(visible=False),
-                gr.update(visible=False),
-                "❌ No readable text found."
-            )
-
-            return
-
-        print(
-            f"Extracted documents: "
-            f"{len(documents)}"
-        )
-
-        # Split
-        all_chunks = split_documents(
-            documents
-        )
-
-        print(
-            f"Created chunks: "
-            f"{len(all_chunks)}"
-        )
-
-        if not all_chunks:
-
-            yield (
-                gr.update(visible=True),
-                gr.update(visible=False),
-                gr.update(visible=False),
-                "❌ Could not create document chunks."
-            )
-
-            return
-
-        # FAISS
-        vector_store = build_faiss(
-            all_chunks
-        )
-
-        # BM25
-        bm25 = build_bm25(
-            all_chunks
-        )
-
-        # Load LLM once
-        load_llm()
-
-        print("Document ready.")
-
-        # Go to search page
-        yield (
-            gr.update(visible=False),
-            gr.update(visible=True),
-            gr.update(visible=False),
-            ""
-        )
-
-    except Exception as e:
-
-        print(
-            "PROCESSING ERROR:",
-            repr(e)
-        )
-
-        yield (
-            gr.update(visible=True),
-            gr.update(visible=False),
-            gr.update(visible=False),
-            f"❌ Error: {str(e)}"
-        )
-
-
-# ============================================================
-# SEARCH
-# ============================================================
-
-def search_document(query):
 
     if not query or not query.strip():
 
         yield (
-            gr.update(visible=False),
             "",
             "",
             "",
-            gr.update(interactive=True)
+            "",
+            gr.update(
+                interactive=True
+            )
         )
 
         return
 
-    query = query.strip()
-
-    # ========================================================
-    # FIRST YIELD
-    #
-    # Loader appears immediately.
-    # Textbox becomes disabled.
-    # Therefore cursor disappears.
-    # ========================================================
+    # --------------------------------------------------------
+    # SHOW LOADER IMMEDIATELY
+    # --------------------------------------------------------
 
     yield (
+        LOADER_HTML,
+        "",
+        "",
+        "",
         gr.update(
-            value=LOADER_HTML,
-            visible=True
-        ),
-        "",
-        "",
-        "",
-        gr.update(interactive=False)
+            interactive=False
+        )
     )
 
     try:
+
+        query = query.strip()
 
         print(
             f"\nQUESTION: {query}"
@@ -1976,30 +1343,27 @@ def search_document(query):
         # Retrieve
         # ----------------------------------------------------
 
-        if is_broad_query(query):
+        if is_broad_query(
+            query
+        ):
 
-            retrieved_docs = (
+            documents = (
                 get_overview_documents()
             )
 
         else:
 
-            retrieved_docs = (
-                retrieve_documents(query)
+            documents = retrieve_documents(
+                query
             )
 
-        print(
-            f"\nFINAL RETRIEVED CHUNKS: "
-            f"{len(retrieved_docs)}"
-        )
-
         # ----------------------------------------------------
-        # Answer
+        # Generate answer
         # ----------------------------------------------------
 
         answer = generate_answer(
             query,
-            retrieved_docs
+            documents
         )
 
         # ----------------------------------------------------
@@ -2007,65 +1371,41 @@ def search_document(query):
         # ----------------------------------------------------
 
         sources = create_sources(
-            retrieved_docs
+            documents
         )
 
-        answer_html = f"""
-        <div class="answer-card">
+        print(
+            "Answer generated."
+        )
 
-            <div class="answer-heading">
-                ✦ ANSWER
-            </div>
-
-            <div class="answer-text">
-                {answer}
-            </div>
-
-        </div>
-        """
-
-        sources_html = f"""
-        <div class="sources-title">
-            Sources
-        </div>
-
-        {sources}
-        """
-
-        # ====================================================
-        # FINAL
-        #
-        # No "Answer generated..." text.
-        # Cursor/input enabled again.
-        # ====================================================
+        # ----------------------------------------------------
+        # HIDE LOADER
+        # ----------------------------------------------------
 
         yield (
-            gr.update(
-                value=LOADER_HTML,
-                visible=False
-            ),
-            answer_html,
-            sources_html,
             "",
-            gr.update(interactive=True)
+            answer,
+            sources,
+            "",
+            gr.update(
+                interactive=True
+            )
         )
 
     except Exception as e:
 
         print(
-            "SEARCH ERROR:",
-            repr(e)
+            f"SEARCH ERROR: {repr(e)}"
         )
 
         yield (
+            "",
+            f"Error: {str(e)}",
+            "",
+            "",
             gr.update(
-                value=LOADER_HTML,
-                visible=False
-            ),
-            "",
-            "",
-            f"❌ Error: {str(e)}",
-            gr.update(interactive=True)
+                interactive=True
+            )
         )
 
 
@@ -2089,19 +1429,491 @@ def reset_app():
     current_filename = ""
 
     return (
-        gr.update(visible=True),
-        gr.update(visible=False),
-        None,
         gr.update(
-            value=PROCESS_LOADER_HTML,
+            visible=True
+        ),
+        gr.update(
             visible=False
         ),
+        None,
         "",
         "",
         "",
-        "",
-        gr.update(interactive=True)
+        ""
     )
+
+
+# ============================================================
+# CSS
+# ============================================================
+
+CSS = """
+
+/* =========================================================
+   GLOBAL
+   ========================================================= */
+
+body {
+
+    background:
+        radial-gradient(
+            circle at top left,
+            #20245a 0%,
+            #0b1028 35%,
+            #050816 75%
+        ) !important;
+
+    color: #ffffff !important;
+
+}
+
+.gradio-container {
+
+    max-width: 1200px !important;
+
+    margin: auto !important;
+
+    background:
+        radial-gradient(
+            circle at 20% 0%,
+            rgba(91, 77, 255, 0.16),
+            transparent 30%
+        ),
+        radial-gradient(
+            circle at 80% 10%,
+            rgba(0, 188, 255, 0.10),
+            transparent 30%
+        ),
+        #070b1c !important;
+
+}
+
+
+/* =========================================================
+   HEADER
+   ========================================================= */
+
+.hero {
+
+    text-align: center;
+
+    padding: 50px 20px 25px;
+
+}
+
+.hero-title {
+
+    font-size: 46px;
+
+    font-weight: 800;
+
+    letter-spacing: -1px;
+
+    background:
+        linear-gradient(
+            90deg,
+            #ffffff,
+            #a78bfa,
+            #67e8f9
+        );
+
+    -webkit-background-clip: text;
+
+    -webkit-text-fill-color: transparent;
+
+}
+
+.hero-subtitle {
+
+    margin-top: 10px;
+
+    color: #aab4d0;
+
+    font-size: 17px;
+
+}
+
+
+/* =========================================================
+   GLASS CARD
+   ========================================================= */
+
+.glass-card {
+
+    background:
+        rgba(
+            17,
+            24,
+            55,
+            0.68
+        ) !important;
+
+    border:
+
+        1px solid
+
+        rgba(
+            255,
+            255,
+            255,
+            0.09
+        ) !important;
+
+    border-radius: 24px !important;
+
+    box-shadow:
+        0 20px 70px
+        rgba(0,0,0,0.30);
+
+    padding: 28px !important;
+
+}
+
+
+/* =========================================================
+   UPLOAD
+   ========================================================= */
+
+.upload-title {
+
+    font-size: 25px;
+
+    font-weight: 700;
+
+    margin-bottom: 8px;
+
+}
+
+.upload-description {
+
+    color: #9ba8c7;
+
+    margin-bottom: 20px;
+
+}
+
+
+/* =========================================================
+   FEATURES
+   ========================================================= */
+
+.feature-card {
+
+    padding: 22px;
+
+    border-radius: 18px;
+
+    background:
+        rgba(
+            255,
+            255,
+            255,
+            0.035
+        );
+
+    border:
+        1px solid
+        rgba(
+            255,
+            255,
+            255,
+            0.07
+        );
+
+    min-height: 110px;
+
+}
+
+.feature-title {
+
+    font-weight: 700;
+
+    margin-bottom: 8px;
+
+}
+
+.feature-text {
+
+    color: #9aa7c5;
+
+    font-size: 14px;
+
+}
+
+
+/* =========================================================
+   TEXTBOX
+   ========================================================= */
+
+textarea,
+input {
+
+    background:
+        rgba(
+            7,
+            12,
+            30,
+            0.75
+        ) !important;
+
+    border:
+        1px solid
+        rgba(
+            126,
+            102,
+            255,
+            0.30
+        ) !important;
+
+    color: white !important;
+
+    border-radius: 16px !important;
+
+}
+
+
+/* =========================================================
+   ANSWER
+   ========================================================= */
+
+.answer-card {
+
+    background:
+        rgba(
+            17,
+            24,
+            55,
+            0.72
+        );
+
+    border:
+        1px solid
+        rgba(
+            123,
+            97,
+            255,
+            0.24
+        );
+
+    border-radius: 22px;
+
+    padding: 25px;
+
+    margin-top: 20px;
+
+    line-height: 1.7;
+
+}
+
+
+/* =========================================================
+   SOURCES
+   ========================================================= */
+
+.sources-wrapper {
+
+    margin-top: 22px;
+
+}
+
+.sources-title {
+
+    font-size: 21px;
+
+    font-weight: 700;
+
+    margin-bottom: 14px;
+
+}
+
+.source-card {
+
+    background:
+        rgba(
+            255,
+            255,
+            255,
+            0.035
+        );
+
+    border:
+        1px solid
+        rgba(
+            255,
+            255,
+            255,
+            0.07
+        );
+
+    border-radius: 16px;
+
+    padding: 17px;
+
+    margin-bottom: 12px;
+
+}
+
+.source-number {
+
+    color: #a78bfa;
+
+    font-weight: 700;
+
+}
+
+.source-page {
+
+    color: #67e8f9;
+
+    font-size: 13px;
+
+    margin-top: 4px;
+
+}
+
+.source-preview {
+
+    color: #aab4d0;
+
+    margin-top: 9px;
+
+    font-size: 14px;
+
+    line-height: 1.5;
+
+}
+
+
+/* =========================================================
+   CUSTOM LOADER
+   ========================================================= */
+
+.loader-area {
+
+    display: flex;
+
+    flex-direction: column;
+
+    align-items: center;
+
+    justify-content: center;
+
+    padding: 55px 20px;
+
+}
+
+.circle-loader {
+
+    position: relative;
+
+    width: 80px;
+
+    height: 80px;
+
+}
+
+.circle-loader span {
+
+    position: absolute;
+
+    left: 50%;
+
+    top: 50%;
+
+    width: 8px;
+
+    height: 8px;
+
+    margin-left: -4px;
+
+    margin-top: -4px;
+
+    border-radius: 50%;
+
+    background: #8b7cff;
+
+    transform:
+        rotate(var(--angle))
+        translateY(-32px);
+
+    animation:
+        loaderFade 1.2s
+        linear infinite;
+
+    animation-delay:
+        calc(
+            var(--angle) / 360 * -1.2s
+        );
+
+}
+
+@keyframes loaderFade {
+
+    0% {
+
+        opacity: 0.20;
+
+    }
+
+    50% {
+
+        opacity: 1;
+
+    }
+
+    100% {
+
+        opacity: 0.20;
+
+    }
+
+}
+
+.loader-text {
+
+    margin-top: 22px;
+
+    color: #b9c4df;
+
+    font-size: 15px;
+
+}
+
+
+/* =========================================================
+   BUTTON
+   ========================================================= */
+
+button {
+
+    border-radius: 14px !important;
+
+}
+
+
+/* =========================================================
+   MOBILE
+   ========================================================= */
+
+@media (
+    max-width: 700px
+) {
+
+    .hero-title {
+
+        font-size: 34px;
+
+    }
+
+    .glass-card {
+
+        padding: 18px !important;
+
+    }
+
+}
+
+"""
 
 
 # ============================================================
@@ -2110,264 +1922,322 @@ def reset_app():
 
 with gr.Blocks(
     title=APP_TITLE
-) as app:
+) as demo:
 
-    # ========================================================
-    # HEADER
-    # ========================================================
+    # --------------------------------------------------------
+    # PAGE 1 — UPLOAD
+    # --------------------------------------------------------
 
-    gr.HTML(
-        """
-        <div class="app-header">
-
-            <div class="app-title">
-                ◈ DocFinder AI
-            </div>
-
-            <div class="app-subtitle">
-                RAG Based AI Assistant for Private Documents
-            </div>
-
-        </div>
-        """
+    upload_page = gr.Column(
+        visible=True
     )
 
-
-    # ========================================================
-    # UPLOAD PAGE
-    # ========================================================
-
-    with gr.Column(
-        visible=True,
-        elem_classes=["glass-card"]
-    ) as upload_page:
+    with upload_page:
 
         gr.HTML(
             """
-            <div class="section-title">
-                Upload your document
-            </div>
+            <div class="hero">
 
-            <div class="section-subtitle">
-                Upload a private document and ask questions naturally.
+                <div class="hero-title">
+                    DocFinder AI
+                </div>
+
+                <div class="hero-subtitle">
+                    Your intelligent document
+                    question-answering assistant
+                </div>
+
             </div>
             """
         )
 
-        file_upload = gr.File(
-            label="",
-            show_label=False,
-            file_types=[
-                ".pdf",
-                ".docx",
-                ".txt"
-            ],
-            type="filepath"
+        with gr.Column(
+            elem_classes="glass-card"
+        ):
+
+            gr.HTML(
+                """
+                <div class="upload-title">
+                    Upload your document
+                </div>
+
+                <div class="upload-description">
+                    Upload a PDF, DOCX, or TXT
+                    file and ask questions using
+                    semantic search.
+                </div>
+                """
+            )
+
+            file_input = gr.File(
+                label="Document",
+                file_types=[
+                    ".pdf",
+                    ".docx",
+                    ".txt"
+                ],
+                type="filepath"
+            )
+
+            process_button = gr.Button(
+                "Process Document",
+                variant="primary"
+            )
+
+            process_status = gr.Markdown(
+                ""
+            )
+
+            process_loader = gr.HTML(
+                "",
+                visible=False
+            )
+
+            with gr.Row():
+
+                gr.HTML(
+                    """
+                    <div class="feature-card">
+
+                        <div class="feature-title">
+                            🔎 Semantic Search
+                        </div>
+
+                        <div class="feature-text">
+                            Understand questions
+                            even when the exact
+                            words are different.
+                        </div>
+
+                    </div>
+                    """
+                )
+
+                gr.HTML(
+                    """
+                    <div class="feature-card">
+
+                        <div class="feature-title">
+                            📄 Document Grounded
+                        </div>
+
+                        <div class="feature-text">
+                            Answers are generated
+                            from your uploaded
+                            document.
+                        </div>
+
+                    </div>
+                    """
+                )
+
+                gr.HTML(
+                    """
+                    <div class="feature-card">
+
+                        <div class="feature-title">
+                            ⚡ Fast Retrieval
+                        </div>
+
+                        <div class="feature-text">
+                            FAISS vector search
+                            combined with lexical
+                            retrieval.
+                        </div>
+
+                    </div>
+                    """
+                )
+
+    # --------------------------------------------------------
+    # PAGE 2 — SEARCH
+    # --------------------------------------------------------
+
+    search_page = gr.Column(
+        visible=False
+    )
+
+    with search_page:
+
+        gr.HTML(
+            """
+            <div class="hero">
+
+                <div class="hero-title">
+                    DocFinder AI
+                </div>
+
+                <div class="hero-subtitle">
+                    Ask anything about your
+                    uploaded document
+                </div>
+
+            </div>
+            """
         )
 
-        process_button = gr.Button(
-            "Process Document",
-            variant="primary",
-            elem_classes=[
-                "primary-button"
-            ]
-        )
+        with gr.Column(
+            elem_classes="glass-card"
+        ):
 
-        process_loader = gr.HTML(
-            PROCESS_LOADER_HTML,
+            question = gr.Textbox(
+                label="Ask your question",
+                placeholder=(
+                    "Ask a question and press Enter..."
+                ),
+                lines=2
+            )
+
+            search_loader = gr.HTML(
+                "",
+                visible=True
+            )
+
+            answer_output = gr.Markdown(
+                "",
+                elem_classes="answer-card"
+            )
+
+            sources_output = gr.HTML(
+                ""
+            )
+
+            search_status = gr.Markdown(
+                ""
+            )
+
+            reset_button = gr.Button(
+                "↻ Try Another Document"
+            )
+
+
+# ============================================================
+# PROCESS FLOW
+# ============================================================
+
+def process_with_loader(file):
+
+    # Show loader first
+    yield (
+        gr.update(
+            visible=True
+        ),
+        "",
+        gr.update(
+            visible=True
+        ),
+        gr.update(
+            visible=False
+        ),
+        gr.update(
             visible=False
         )
-
-        process_status = gr.HTML(
-            "",
-            elem_classes=[
-                "status-text"
-            ]
-        )
-
-        gr.HTML(
-            """
-            <div class="feature-grid">
-
-                <div class="feature-card">
-
-                    <div class="feature-title">
-                        🔒 Private
-                    </div>
-
-                    <div class="feature-text">
-                        Your document is processed locally.
-                    </div>
-
-                </div>
-
-                <div class="feature-card">
-
-                    <div class="feature-title">
-                        🔎 Semantic Search
-                    </div>
-
-                    <div class="feature-text">
-                        Ask questions naturally.
-                    </div>
-
-                </div>
-
-                <div class="feature-card">
-
-                    <div class="feature-title">
-                        ⚡ RAG Powered
-                    </div>
-
-                    <div class="feature-text">
-                        Answers are grounded in your document.
-                    </div>
-
-                </div>
-
-            </div>
-            """
-        )
-
-
-    # ========================================================
-    # SEARCH PAGE
-    # ========================================================
-
-    with gr.Column(
-        visible=False,
-        elem_classes=["glass-card"]
-    ) as search_page:
-
-        gr.HTML(
-            """
-            <div class="section-title">
-                Search your document
-            </div>
-
-            <div class="section-subtitle">
-                Ask questions naturally.
-            </div>
-            """
-        )
-
-        question = gr.Textbox(
-            label="",
-            show_label=False,
-            placeholder="Ask something about your document...",
-            lines=1,
-            elem_classes=[
-                "question-box"
-            ],
-            autofocus=True
-        )
-
-        gr.HTML(
-            """
-            <div class="enter-hint">
-                Press Enter to search
-            </div>
-            """
-        )
-
-        # Custom loader
-        search_loader = gr.HTML(
-            LOADER_HTML,
-            visible=False
-        )
-
-        answer_output = gr.HTML(
-            ""
-        )
-
-        # Intentionally empty
-        search_status = gr.HTML(
-            "",
-            elem_classes=[
-                "status-text"
-            ]
-        )
-
-        sources_output = gr.HTML(
-            ""
-        )
-
-        reset_button = gr.Button(
-            "↻ Try Another Document",
-            elem_classes=[
-                "reset-button"
-            ]
-        )
-
-
-    # ========================================================
-    # EVENTS
-    # ========================================================
-
-    process_button.click(
-        fn=process_document,
-        inputs=[
-            file_upload
-        ],
-        outputs=[
-            upload_page,
-            search_page,
-            process_loader,
-            process_status
-        ],
-        show_progress="hidden"
     )
 
-
-    # ========================================================
-    # ENTER TO SEARCH
-    # ========================================================
-
-    question.submit(
-        fn=search_document,
-        inputs=[
-            question
-        ],
-        outputs=[
-            search_loader,
-            answer_output,
-            sources_output,
-            search_status,
-            question
-        ],
-        show_progress="hidden"
+    status, message = process_document(
+        file
     )
 
+    if status == "ready":
 
-    # ========================================================
-    # RESET
-    # ========================================================
+        yield (
+            gr.update(
+                visible=False
+            ),
+            message,
+            gr.update(
+                visible=False
+            ),
+            gr.update(
+                visible=True
+            ),
+            gr.update(
+                visible=False
+            )
+        )
 
-    reset_button.click(
-        fn=reset_app,
-        inputs=[],
-        outputs=[
-            upload_page,
-            search_page,
-            file_upload,
-            process_loader,
-            process_status,
-            answer_output,
-            sources_output,
-            search_status,
-            question
-        ],
-        show_progress="hidden"
-    )
+    else:
+
+        yield (
+            gr.update(
+                visible=False
+            ),
+            message,
+            gr.update(
+                visible=False
+            ),
+            gr.update(
+                visible=True
+            ),
+            gr.update(
+                visible=False
+            )
+        )
+
+
+# ============================================================
+# EVENTS
+# ============================================================
+
+process_button.click(
+
+    fn=process_with_loader,
+
+    inputs=[
+        file_input
+    ],
+
+    outputs=[
+        process_loader,
+        process_status,
+        upload_page,
+        search_page,
+        search_loader
+    ]
+)
+
+
+question.submit(
+
+    fn=search_document,
+
+    inputs=[
+        question
+    ],
+
+    outputs=[
+        search_loader,
+        answer_output,
+        sources_output,
+        search_status,
+        question
+    ]
+)
+
+
+reset_button.click(
+
+    fn=reset_app,
+
+    inputs=[],
+
+    outputs=[
+        upload_page,
+        search_page,
+        file_input,
+        process_status,
+        search_loader,
+        answer_output,
+        sources_output
+    ]
+)
 
 
 # ============================================================
 # LAUNCH
 # ============================================================
 
-if __name__ == "__main__":
-
-    app.launch(
-        inbrowser=True,
-        css=CSS
-    )
+demo.launch(
+    inbrowser=True,
+    css=CSS
+)
