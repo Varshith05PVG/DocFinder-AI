@@ -119,28 +119,44 @@ def load_embeddings():
 
 
 # ============================================================
-# ZERO GPU — LOAD QWEN AT MODULE LEVEL
+# ZERO GPU — LAZY LOAD QWEN
+# ============================================================
+#
+# IMPORTANT:
+# Do NOT initialize the CUDA-backed pipeline at import time on
+# Hugging Face ZeroGPU. The pipeline is created only after the
+# @spaces.GPU function receives GPU resources.
+#
+# Locally, the same function uses CPU.
 # ============================================================
 
-print("Preparing Qwen 0.5B...")
-
-llm = pipeline(
-    "text-generation",
-    model=LLM_MODEL,
-    tokenizer=LLM_MODEL,
-    return_full_text=False,
-    device=LLM_DEVICE
-)
-
-print("Qwen pipeline ready.")
+llm = None
 
 
 # ============================================================
 # ZERO GPU — ACTUAL LLM GENERATION
 # ============================================================
 
-@spaces.GPU(duration=30)
+@spaces.GPU(duration=15)
 def run_llm(prompt: str) -> str:
+
+    global llm
+
+    if llm is None:
+
+        print("Preparing Qwen 0.5B...")
+
+        llm = pipeline(
+            "text-generation",
+            model=LLM_MODEL,
+            tokenizer=LLM_MODEL,
+            max_new_tokens=MAX_NEW_TOKENS,
+            do_sample=False,
+            return_full_text=False,
+            device=LLM_DEVICE
+        )
+
+        print("Qwen pipeline ready.")
 
     result = llm(
         prompt,
@@ -1324,7 +1340,10 @@ def search_document(
     # --------------------------------------------------------
 
     yield (
-        LOADER_HTML,
+        gr.update(
+            value=LOADER_HTML,
+            visible=True
+        ),
         "",
         "",
         "",
@@ -1385,7 +1404,10 @@ def search_document(
         # ----------------------------------------------------
 
         yield (
-            "",
+            gr.update(
+                value="",
+                visible=False
+            ),
             answer,
             sources,
             "",
@@ -1401,7 +1423,10 @@ def search_document(
         )
 
         yield (
-            "",
+            gr.update(
+                value="",
+                visible=False
+            ),
             f"Error: {str(e)}",
             "",
             "",
@@ -2119,9 +2144,12 @@ with gr.Blocks(
 
 def process_with_loader(file):
 
-    # Show loader first
+    # Show the CUSTOM loader first. The previous version only
+    # changed visibility, so the loader component was visible but
+    # contained no HTML.
     yield (
         gr.update(
+            value=PROCESS_LOADER_HTML,
             visible=True
         ),
         "",
@@ -2195,7 +2223,9 @@ process_button.click(
         upload_page,
         search_page,
         search_loader
-    ]
+    ],
+
+    show_progress="hidden"
 )
 
 
@@ -2213,7 +2243,11 @@ question.submit(
         sources_output,
         search_status,
         question
-    ]
+    ],
+
+    show_progress="hidden",
+
+    js="() => { document.activeElement?.blur(); }"
 )
 
 
@@ -2231,13 +2265,19 @@ reset_button.click(
         search_loader,
         answer_output,
         sources_output
-    ]
+    ],
+
+    show_progress="hidden"
 )
 
 
 # ============================================================
 # LAUNCH
 # ============================================================
+
+# Required for generator-based custom loader updates to stream
+# to the browser immediately.
+demo.queue()
 
 demo.launch(
     inbrowser=True,
