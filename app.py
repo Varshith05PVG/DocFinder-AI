@@ -1,15 +1,16 @@
 # ============================================================
 # DocFinder AI — RAG Based AI Assistant
+# ZeroGPU-compatible version
 # ============================================================
 
 # IMPORTANT:
-# Import spaces before transformers / torch-related imports.
+# spaces MUST be imported before torch / transformers
 import spaces
 
 import os
 import re
 from pathlib import Path
-from typing import List
+from typing import List, Dict
 
 import gradio as gr
 import pymupdf
@@ -32,13 +33,9 @@ from transformers import pipeline
 
 APP_TITLE = "DocFinder AI"
 
-EMBEDDING_MODEL = (
-    "sentence-transformers/all-MiniLM-L6-v2"
-)
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
-LLM_MODEL = (
-    "Qwen/Qwen2.5-0.5B-Instruct"
-)
+LLM_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 
 SEMANTIC_TOP_K = 8
 BM25_TOP_K = 8
@@ -49,23 +46,16 @@ CHUNK_OVERLAP = 120
 
 MAX_NEW_TOKENS = 70
 
-TESSERACT_PATH = (
-    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-)
+TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 
 # ============================================================
 # TESSERACT
 # ============================================================
 
-# Works locally on Windows.
-# On Hugging Face Linux, Tesseract is provided through
-# packages.txt and is found through PATH.
+# Windows local environment
 if os.path.exists(TESSERACT_PATH):
-
-    pytesseract.pytesseract.tesseract_cmd = (
-        TESSERACT_PATH
-    )
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
 
 
 # ============================================================
@@ -82,9 +72,27 @@ embedding_model = None
 
 current_filename = ""
 
+# ------------------------------------------------------------
+# ZERO GPU / LLM
+# ------------------------------------------------------------
+#
+# IMPORTANT:
+# On Hugging Face ZeroGPU, model placement must happen at
+# module scope so ZeroGPU can intercept/register it.
+#
+# Locally, use CPU.
+#
+# ZeroGPU sets SPACES_ZERO_GPU=1.
+# ------------------------------------------------------------
+
+if os.getenv("SPACES_ZERO_GPU") == "1":
+    LLM_DEVICE = "cuda"
+else:
+    LLM_DEVICE = -1
+
 
 # ============================================================
-# EMBEDDINGS
+# LOAD EMBEDDING MODEL
 # ============================================================
 
 def load_embeddings():
@@ -111,19 +119,8 @@ def load_embeddings():
 
 
 # ============================================================
-# ZERO GPU — QWEN
+# ZERO GPU — LOAD QWEN AT MODULE LEVEL
 # ============================================================
-
-# Hugging Face ZeroGPU sets this environment variable.
-# Locally we use CPU.
-if os.getenv("SPACES_ZERO_GPU") == "1":
-
-    LLM_DEVICE = "cuda"
-
-else:
-
-    LLM_DEVICE = -1
-
 
 print("Preparing Qwen 0.5B...")
 
@@ -131,8 +128,6 @@ llm = pipeline(
     "text-generation",
     model=LLM_MODEL,
     tokenizer=LLM_MODEL,
-    max_new_tokens=MAX_NEW_TOKENS,
-    do_sample=False,
     return_full_text=False,
     device=LLM_DEVICE
 )
@@ -141,16 +136,19 @@ print("Qwen pipeline ready.")
 
 
 # ============================================================
-# ZERO GPU — LLM INFERENCE
+# ZERO GPU — ACTUAL LLM GENERATION
 # ============================================================
 
-@spaces.GPU(duration=15)
+@spaces.GPU(duration=30)
 def run_llm(prompt: str) -> str:
 
-    result = llm(prompt)
+    result = llm(
+        prompt,
+        max_new_tokens=MAX_NEW_TOKENS,
+        do_sample=False
+    )
 
     if not result:
-
         return ""
 
     return result[0].get(
@@ -160,32 +158,25 @@ def run_llm(prompt: str) -> str:
 
 
 # ============================================================
-# DOCUMENT EXTRACTION
+# FILE EXTRACTION
 # ============================================================
 
-def extract_pdf(
-    file_path: str
-) -> List[Document]:
+def extract_pdf(file_path: str) -> List[Document]:
 
     documents = []
 
-    pdf = pymupdf.open(
-        file_path
-    )
+    pdf = pymupdf.open(file_path)
 
-    print(
-        f"Pages loaded: {len(pdf)}"
-    )
+    print(f"Pages loaded: {len(pdf)}")
 
-    for page_number, page in enumerate(
-        pdf
-    ):
+    for page_number, page in enumerate(pdf):
 
-        text = page.get_text(
-            "text"
-        ).strip()
+        text = page.get_text("text").strip()
 
-        # OCR fallback
+        # ----------------------------------------------------
+        # OCR fallback for scanned PDFs
+        # ----------------------------------------------------
+
         if not text:
 
             print(
@@ -194,26 +185,18 @@ def extract_pdf(
             )
 
             pix = page.get_pixmap(
-                matrix=pymupdf.Matrix(
-                    2,
-                    2
-                )
+                matrix=pymupdf.Matrix(2, 2)
             )
 
             img = Image.frombytes(
                 "RGB",
-                [
-                    pix.width,
-                    pix.height
-                ],
+                [pix.width, pix.height],
                 pix.samples
             )
 
-            text = (
-                pytesseract
-                .image_to_string(img)
-                .strip()
-            )
+            text = pytesseract.image_to_string(
+                img
+            ).strip()
 
         if text:
 
@@ -231,13 +214,9 @@ def extract_pdf(
     return documents
 
 
-def extract_docx(
-    file_path: str
-) -> List[Document]:
+def extract_docx(file_path: str) -> List[Document]:
 
-    doc = DocxDocument(
-        file_path
-    )
+    doc = DocxDocument(file_path)
 
     text_parts = []
 
@@ -246,17 +225,11 @@ def extract_docx(
         text = paragraph.text.strip()
 
         if text:
+            text_parts.append(text)
 
-            text_parts.append(
-                text
-            )
-
-    text = "\n".join(
-        text_parts
-    )
+    text = "\n".join(text_parts)
 
     if not text:
-
         return []
 
     return [
@@ -269,9 +242,7 @@ def extract_docx(
     ]
 
 
-def extract_txt(
-    file_path: str
-) -> List[Document]:
+def extract_txt(file_path: str) -> List[Document]:
 
     with open(
         file_path,
@@ -283,7 +254,6 @@ def extract_txt(
         text = f.read().strip()
 
     if not text:
-
         return []
 
     return [
@@ -296,33 +266,21 @@ def extract_txt(
     ]
 
 
-def extract_document(
-    file_path: str
-) -> List[Document]:
+def extract_document(file_path: str) -> List[Document]:
 
-    extension = (
-        Path(file_path)
-        .suffix
-        .lower()
-    )
+    extension = Path(file_path).suffix.lower()
 
     if extension == ".pdf":
 
-        return extract_pdf(
-            file_path
-        )
+        return extract_pdf(file_path)
 
     if extension == ".docx":
 
-        return extract_docx(
-            file_path
-        )
+        return extract_docx(file_path)
 
     if extension == ".txt":
 
-        return extract_txt(
-            file_path
-        )
+        return extract_txt(file_path)
 
     raise ValueError(
         "Unsupported file type. "
@@ -355,29 +313,24 @@ def create_chunks(
         ]
     )
 
-    return splitter.split_documents(
+    chunks = splitter.split_documents(
         documents
     )
 
+    return chunks
+
 
 # ============================================================
-# BM25
+# BUILD BM25
 # ============================================================
 
-def build_bm25(
-    chunks: List[Document]
-):
+def build_bm25(chunks: List[Document]):
 
     global bm25
 
     tokenized_documents = [
-
-        chunk.page_content
-        .lower()
-        .split()
-
+        chunk.page_content.lower().split()
         for chunk in chunks
-
     ]
 
     if tokenized_documents:
@@ -395,15 +348,13 @@ def build_bm25(
 # PROCESS DOCUMENT
 # ============================================================
 
-def process_document(
-    file_path
-):
+def process_document(file):
 
     global all_chunks
     global vector_store
     global current_filename
 
-    if file_path is None:
+    if file is None:
 
         return (
             "",
@@ -412,13 +363,14 @@ def process_document(
 
     try:
 
-        current_filename = (
-            Path(file_path).name
-        )
+        file_path = file
+
+        current_filename = Path(
+            file_path
+        ).name
 
         print(
-            f"Processing: "
-            f"{current_filename}"
+            f"Processing: {current_filename}"
         )
 
         documents = extract_document(
@@ -449,8 +401,8 @@ def process_document(
         embeddings = load_embeddings()
 
         print(
-            f"Creating FAISS index "
-            f"for {len(all_chunks)} chunks..."
+            f"Creating FAISS index for "
+            f"{len(all_chunks)} chunks..."
         )
 
         vector_store = FAISS.from_documents(
@@ -484,12 +436,10 @@ def process_document(
 
 
 # ============================================================
-# INTENT DETECTION
+# QUERY INTENT
 # ============================================================
 
-def detect_intent(
-    query: str
-) -> str:
+def detect_intent(query: str) -> str:
 
     q = query.lower().strip()
 
@@ -505,7 +455,6 @@ def detect_intent(
             "technical"
         ]
     ):
-
         return "skills"
 
     if any(
@@ -518,7 +467,6 @@ def detect_intent(
             "qualification"
         ]
     ):
-
         return "education"
 
     if any(
@@ -530,7 +478,6 @@ def detect_intent(
             "worked"
         ]
     ):
-
         return "experience"
 
     if any(
@@ -540,7 +487,6 @@ def detect_intent(
             "projects"
         ]
     ):
-
         return "projects"
 
     if any(
@@ -552,7 +498,6 @@ def detect_intent(
             "mobile"
         ]
     ):
-
         return "contact"
 
     return "general"
@@ -562,17 +507,11 @@ def detect_intent(
 # QUERY EXPANSION
 # ============================================================
 
-def expand_query(
-    query: str
-) -> List[str]:
+def expand_query(query: str) -> List[str]:
 
-    intent = detect_intent(
-        query
-    )
+    intent = detect_intent(query)
 
-    queries = [
-        query
-    ]
+    queries = [query]
 
     if intent == "skills":
 
@@ -642,14 +581,12 @@ def keyword_score(
         return 0.0
 
     overlap = (
-        query_words
-        .intersection(text_words)
+        query_words.intersection(
+            text_words
+        )
     )
 
-    return (
-        len(overlap)
-        / len(query_words)
-    )
+    return len(overlap) / len(query_words)
 
 
 # ============================================================
@@ -661,9 +598,7 @@ def intent_score(
     text: str
 ) -> float:
 
-    intent = detect_intent(
-        query
-    )
+    intent = detect_intent(query)
 
     text_lower = text.lower()
 
@@ -730,9 +665,7 @@ def intent_score(
         if term in text_lower
     )
 
-    return (
-        matches / len(terms)
-    )
+    return matches / len(terms)
 
 
 # ============================================================
@@ -748,23 +681,25 @@ def retrieve_documents(
 
         return []
 
+    embeddings = load_embeddings()
+
+    # --------------------------------------------------------
+    # Semantic retrieval
+    # --------------------------------------------------------
+
     semantic_results = []
 
-    expanded_queries = (
-        expand_query(query)
+    expanded_queries = expand_query(
+        query
     )
 
-    # Semantic retrieval
     for expanded_query in expanded_queries:
 
         try:
 
-            results = (
-                vector_store
-                .similarity_search(
-                    expanded_query,
-                    k=SEMANTIC_TOP_K
-                )
+            results = vector_store.similarity_search(
+                expanded_query,
+                k=SEMANTIC_TOP_K
             )
 
             semantic_results.extend(
@@ -778,14 +713,15 @@ def retrieve_documents(
                 f"{repr(e)}"
             )
 
+    # --------------------------------------------------------
     # BM25 retrieval
+    # --------------------------------------------------------
+
     bm25_results = []
 
     if bm25 is not None:
 
-        query_tokens = (
-            query.lower().split()
-        )
+        query_tokens = query.lower().split()
 
         scores = bm25.get_scores(
             query_tokens
@@ -802,14 +738,17 @@ def retrieve_documents(
             for i in ranked_indices
         ]
 
-    # Unique candidates
+    # --------------------------------------------------------
+    # Unique candidate documents
+    # --------------------------------------------------------
+
     candidates = []
 
     seen = set()
 
     for doc in (
-        semantic_results
-        + bm25_results
+        semantic_results +
+        bm25_results
     ):
 
         text = doc.page_content
@@ -818,11 +757,12 @@ def retrieve_documents(
 
             seen.add(text)
 
-            candidates.append(
-                doc
-            )
+            candidates.append(doc)
 
-    # Score
+    # --------------------------------------------------------
+    # Score candidates
+    # --------------------------------------------------------
+
     scored = []
 
     semantic_texts = [
@@ -834,11 +774,11 @@ def retrieve_documents(
 
         text = doc.page_content
 
-        semantic = (
-            1.0
-            if text in semantic_texts
-            else 0.0
-        )
+        semantic = 0.0
+
+        if text in semantic_texts:
+
+            semantic = 1.0
 
         bm25_value = 0.0
 
@@ -846,10 +786,8 @@ def retrieve_documents(
 
             try:
 
-                index = (
-                    all_chunks.index(
-                        doc
-                    )
+                index = all_chunks.index(
+                    doc
                 )
 
                 query_tokens = (
@@ -865,8 +803,8 @@ def retrieve_documents(
                 if maximum > 0:
 
                     bm25_value = (
-                        scores[index]
-                        / maximum
+                        scores[index] /
+                        maximum
                     )
 
             except Exception:
@@ -917,9 +855,7 @@ def retrieve_documents(
 
     final_documents = [
         item[1]
-        for item in scored[
-            :k
-        ]
+        for item in scored[:k]
     ]
 
     print(
@@ -931,7 +867,7 @@ def retrieve_documents(
 
 
 # ============================================================
-# BROAD QUERY
+# BROAD QUERY DETECTION
 # ============================================================
 
 def is_broad_query(
@@ -941,25 +877,15 @@ def is_broad_query(
     q = query.lower().strip()
 
     broad_phrases = [
-
         "tell me about this document",
-
         "tell me about the document",
-
         "summarize this document",
-
         "summarize the document",
-
         "give me a summary",
-
         "what is this document about",
-
         "what does this document contain",
-
         "overview",
-
         "summarize"
-
     ]
 
     return any(
@@ -968,15 +894,17 @@ def is_broad_query(
     )
 
 
+# ============================================================
+# OVERVIEW RETRIEVAL
+# ============================================================
+
 def get_overview_documents():
 
     if not all_chunks:
 
         return []
 
-    return all_chunks[
-        :FINAL_TOP_K
-    ]
+    return all_chunks[:FINAL_TOP_K]
 
 
 # ============================================================
@@ -1034,7 +962,6 @@ def extract_section_answer(
             "contact",
             "contact information"
         ]
-
     }
 
     headings = heading_map[
@@ -1048,9 +975,7 @@ def extract_section_answer(
             .splitlines()
         )
 
-        for i, line in enumerate(
-            lines
-        ):
+        for i, line in enumerate(lines):
 
             normalized = (
                 line.strip()
@@ -1058,89 +983,86 @@ def extract_section_answer(
                 .rstrip(":")
             )
 
-            if normalized not in headings:
+            if normalized in headings:
 
-                continue
+                collected = []
 
-            collected = []
+                # ------------------------------------------------
+                # Inline content after heading
+                # ------------------------------------------------
 
-            original = line.strip()
+                original = line.strip()
 
-            # Inline heading content
-            if ":" in original:
+                if ":" in original:
 
-                remainder = (
-                    original
-                    .split(
-                        ":",
-                        1
-                    )[1]
-                    .strip()
-                )
+                    remainder = (
+                        original.split(
+                            ":",
+                            1
+                        )[1].strip()
+                    )
 
-                if remainder:
+                    if remainder:
+
+                        collected.append(
+                            remainder
+                        )
+
+                # ------------------------------------------------
+                # Following lines
+                # ------------------------------------------------
+
+                for next_line in lines[
+                    i + 1:
+                ]:
+
+                    clean = next_line.strip()
+
+                    if not clean:
+
+                        continue
+
+                    lower = clean.lower()
+
+                    # Stop at another section heading
+                    if (
+                        clean.isupper()
+                        and len(clean) < 80
+                    ):
+
+                        break
+
+                    if any(
+                        lower.startswith(
+                            heading + ":"
+                        )
+                        for heading in [
+                            "education",
+                            "experience",
+                            "projects",
+                            "certifications",
+                            "achievements",
+                            "contact",
+                            "summary",
+                            "objective"
+                        ]
+                    ):
+
+                        break
 
                     collected.append(
-                        remainder
+                        clean
                     )
 
-            # Following lines
-            for next_line in lines[
-                i + 1:
-            ]:
+                if collected:
 
-                clean = (
-                    next_line.strip()
-                )
-
-                if not clean:
-
-                    continue
-
-                lower = clean.lower()
-
-                # Stop at uppercase section
-                if (
-                    clean.isupper()
-                    and len(clean) < 80
-                ):
-
-                    break
-
-                if any(
-                    lower.startswith(
-                        heading + ":"
-                    )
-                    for heading in [
-                        "education",
-                        "experience",
-                        "projects",
-                        "certifications",
-                        "achievements",
-                        "contact",
-                        "summary",
-                        "objective"
-                    ]
-                ):
-
-                    break
-
-                collected.append(
-                    clean
-                )
-
-            if collected:
-
-                answer = (
-                    "\n".join(
+                    answer = "\n".join(
                         collected
-                    )
-                    .strip()
-                )
+                    ).strip()
 
-                if answer:
+                    if answer:
 
-                    return answer
+                        return answer
 
     return ""
 
@@ -1154,7 +1076,10 @@ def generate_answer(
     documents: List[Document]
 ) -> str:
 
-    # Direct section extraction
+    # --------------------------------------------------------
+    # Direct section answer
+    # --------------------------------------------------------
+
     direct_answer = (
         extract_section_answer(
             query
@@ -1165,6 +1090,10 @@ def generate_answer(
 
         return direct_answer
 
+    # --------------------------------------------------------
+    # No retrieved information
+    # --------------------------------------------------------
+
     if not documents:
 
         return (
@@ -1173,7 +1102,10 @@ def generate_answer(
             "document."
         )
 
-    # Context
+    # --------------------------------------------------------
+    # Build context
+    # --------------------------------------------------------
+
     context_parts = []
 
     for doc in documents:
@@ -1186,11 +1118,13 @@ def generate_answer(
         context_parts
     )
 
-    context = context[
-        :6000
-    ]
+    # Keep prompt reasonably small
+    context = context[:6000]
 
+    # --------------------------------------------------------
     # Prompt
+    # --------------------------------------------------------
+
     prompt = f"""
 You are DocFinder AI, a document question-answering assistant.
 
@@ -1220,7 +1154,9 @@ ANSWER:
             prompt
         )
 
-        if not result:
+        answer = result
+
+        if not answer:
 
             return (
                 "I couldn't find that "
@@ -1228,7 +1164,7 @@ ANSWER:
                 "document."
             )
 
-        return result.strip()
+        return answer.strip()
 
     except Exception as e:
 
@@ -1242,7 +1178,7 @@ ANSWER:
 
 
 # ============================================================
-# SOURCES
+# SOURCE CREATION
 # ============================================================
 
 def create_sources(
@@ -1267,24 +1203,20 @@ def create_sources(
 
         preview = (
             doc.page_content
-            .replace(
-                "\n",
-                " "
-            )
+            .replace("\n", " ")
             .strip()
         )
 
         if len(preview) > 220:
 
             preview = (
-                preview[:220]
-                + "..."
+                preview[:220] +
+                "..."
             )
 
         cards.append(
             f"""
             <div class="source-card">
-
                 <div class="source-number">
                     Source {index}
                 </div>
@@ -1296,7 +1228,6 @@ def create_sources(
                 <div class="source-preview">
                     {preview}
                 </div>
-
             </div>
             """
         )
@@ -1315,7 +1246,7 @@ def create_sources(
 
 
 # ============================================================
-# LOADERS
+# SEARCH LOADER
 # ============================================================
 
 LOADER_HTML = """
@@ -1367,7 +1298,7 @@ PROCESS_LOADER_HTML = """
 
 
 # ============================================================
-# SEARCH
+# SEARCH FUNCTION
 # ============================================================
 
 def search_document(
@@ -1388,7 +1319,10 @@ def search_document(
 
         return
 
-    # Immediately show loader
+    # --------------------------------------------------------
+    # SHOW LOADER IMMEDIATELY
+    # --------------------------------------------------------
+
     yield (
         LOADER_HTML,
         "",
@@ -1407,6 +1341,10 @@ def search_document(
             f"\nQUESTION: {query}"
         )
 
+        # ----------------------------------------------------
+        # Retrieve
+        # ----------------------------------------------------
+
         if is_broad_query(
             query
         ):
@@ -1421,10 +1359,18 @@ def search_document(
                 query
             )
 
+        # ----------------------------------------------------
+        # Generate answer
+        # ----------------------------------------------------
+
         answer = generate_answer(
             query,
             documents
         )
+
+        # ----------------------------------------------------
+        # Sources
+        # ----------------------------------------------------
 
         sources = create_sources(
             documents
@@ -1434,7 +1380,10 @@ def search_document(
             "Answer generated."
         )
 
-        # Hide loader
+        # ----------------------------------------------------
+        # HIDE LOADER
+        # ----------------------------------------------------
+
         yield (
             "",
             answer,
@@ -1497,78 +1446,14 @@ def reset_app():
 
 
 # ============================================================
-# PROCESS WITH LOADER
-# ============================================================
-
-def process_with_loader(
-    file
-):
-
-    # Show loader first
-    yield (
-        gr.update(
-            visible=True
-        ),
-        "",
-        gr.update(
-            visible=True
-        ),
-        gr.update(
-            visible=False
-        ),
-        gr.update(
-            visible=False
-        )
-    )
-
-    status, message = (
-        process_document(
-            file
-        )
-    )
-
-    if status == "ready":
-
-        yield (
-            gr.update(
-                visible=False
-            ),
-            message,
-            gr.update(
-                visible=False
-            ),
-            gr.update(
-                visible=True
-            ),
-            gr.update(
-                visible=False
-            )
-        )
-
-    else:
-
-        yield (
-            gr.update(
-                visible=False
-            ),
-            message,
-            gr.update(
-                visible=False
-            ),
-            gr.update(
-                visible=True
-            ),
-            gr.update(
-                visible=False
-            )
-        )
-
-
-# ============================================================
 # CSS
 # ============================================================
 
 CSS = """
+
+/* =========================================================
+   GLOBAL
+   ========================================================= */
 
 body {
 
@@ -1581,8 +1466,8 @@ body {
         ) !important;
 
     color: #ffffff !important;
-}
 
+}
 
 .gradio-container {
 
@@ -1593,42 +1478,30 @@ body {
     background:
         radial-gradient(
             circle at 20% 0%,
-            rgba(
-                91,
-                77,
-                255,
-                0.16
-            ),
+            rgba(91, 77, 255, 0.16),
             transparent 30%
         ),
         radial-gradient(
             circle at 80% 10%,
-            rgba(
-                0,
-                188,
-                255,
-                0.10
-            ),
+            rgba(0, 188, 255, 0.10),
             transparent 30%
         ),
         #070b1c !important;
+
 }
 
 
 /* =========================================================
-   HERO
+   HEADER
    ========================================================= */
 
 .hero {
 
     text-align: center;
 
-    padding:
-        50px
-        20px
-        25px;
-}
+    padding: 50px 20px 25px;
 
+}
 
 .hero-title {
 
@@ -1649,8 +1522,8 @@ body {
     -webkit-background-clip: text;
 
     -webkit-text-fill-color: transparent;
-}
 
+}
 
 .hero-subtitle {
 
@@ -1659,6 +1532,7 @@ body {
     color: #aab4d0;
 
     font-size: 17px;
+
 }
 
 
@@ -1677,7 +1551,9 @@ body {
         ) !important;
 
     border:
+
         1px solid
+
         rgba(
             255,
             255,
@@ -1689,14 +1565,10 @@ body {
 
     box-shadow:
         0 20px 70px
-        rgba(
-            0,
-            0,
-            0,
-            0.30
-        );
+        rgba(0,0,0,0.30);
 
     padding: 28px !important;
+
 }
 
 
@@ -1711,14 +1583,15 @@ body {
     font-weight: 700;
 
     margin-bottom: 8px;
-}
 
+}
 
 .upload-description {
 
     color: #9ba8c7;
 
     margin-bottom: 20px;
+
 }
 
 
@@ -1750,22 +1623,23 @@ body {
         );
 
     min-height: 110px;
-}
 
+}
 
 .feature-title {
 
     font-weight: 700;
 
     margin-bottom: 8px;
-}
 
+}
 
 .feature-text {
 
     color: #9aa7c5;
 
     font-size: 14px;
+
 }
 
 
@@ -1796,6 +1670,7 @@ input {
     color: white !important;
 
     border-radius: 16px !important;
+
 }
 
 
@@ -1829,6 +1704,7 @@ input {
     margin-top: 20px;
 
     line-height: 1.7;
+
 }
 
 
@@ -1839,8 +1715,8 @@ input {
 .sources-wrapper {
 
     margin-top: 22px;
-}
 
+}
 
 .sources-title {
 
@@ -1849,8 +1725,8 @@ input {
     font-weight: 700;
 
     margin-bottom: 14px;
-}
 
+}
 
 .source-card {
 
@@ -1876,16 +1752,16 @@ input {
     padding: 17px;
 
     margin-bottom: 12px;
-}
 
+}
 
 .source-number {
 
     color: #a78bfa;
 
     font-weight: 700;
-}
 
+}
 
 .source-page {
 
@@ -1894,8 +1770,8 @@ input {
     font-size: 13px;
 
     margin-top: 4px;
-}
 
+}
 
 .source-preview {
 
@@ -1906,11 +1782,12 @@ input {
     font-size: 14px;
 
     line-height: 1.5;
+
 }
 
 
 /* =========================================================
-   LOADER
+   CUSTOM LOADER
    ========================================================= */
 
 .loader-area {
@@ -1924,8 +1801,8 @@ input {
     justify-content: center;
 
     padding: 55px 20px;
-}
 
+}
 
 .circle-loader {
 
@@ -1934,8 +1811,8 @@ input {
     width: 80px;
 
     height: 80px;
-}
 
+}
 
 .circle-loader span {
 
@@ -1962,35 +1839,37 @@ input {
         translateY(-32px);
 
     animation:
-        loaderFade
-        1.2s
-        linear
-        infinite;
+        loaderFade 1.2s
+        linear infinite;
 
     animation-delay:
         calc(
-            var(--angle)
-            / 360
-            * -1.2s
+            var(--angle) / 360 * -1.2s
         );
-}
 
+}
 
 @keyframes loaderFade {
 
     0% {
+
         opacity: 0.20;
+
     }
 
     50% {
+
         opacity: 1;
+
     }
 
     100% {
-        opacity: 0.20;
-    }
-}
 
+        opacity: 0.20;
+
+    }
+
+}
 
 .loader-text {
 
@@ -1999,14 +1878,24 @@ input {
     color: #b9c4df;
 
     font-size: 15px;
+
 }
 
+
+/* =========================================================
+   BUTTON
+   ========================================================= */
 
 button {
 
     border-radius: 14px !important;
+
 }
 
+
+/* =========================================================
+   MOBILE
+   ========================================================= */
 
 @media (
     max-width: 700px
@@ -2015,36 +1904,31 @@ button {
     .hero-title {
 
         font-size: 34px;
+
     }
 
     .glass-card {
 
         padding: 18px !important;
+
     }
+
 }
 
 """
 
 
 # ============================================================
-# GRADIO UI
-# ============================================================
-#
-# IMPORTANT:
-# All event handlers are INSIDE this Blocks context.
-# This fixes:
-#
-# AttributeError:
-# Cannot call click outside of a gradio.Blocks context.
+# UI
 # ============================================================
 
 with gr.Blocks(
     title=APP_TITLE
 ) as demo:
 
-    # ========================================================
+    # --------------------------------------------------------
     # PAGE 1 — UPLOAD
-    # ========================================================
+    # --------------------------------------------------------
 
     upload_page = gr.Column(
         visible=True
@@ -2167,10 +2051,9 @@ with gr.Blocks(
                     """
                 )
 
-
-    # ========================================================
+    # --------------------------------------------------------
     # PAGE 2 — SEARCH
-    # ========================================================
+    # --------------------------------------------------------
 
     search_page = gr.Column(
         visible=False
@@ -2230,65 +2113,126 @@ with gr.Blocks(
             )
 
 
-    # ========================================================
-    # EVENT HANDLERS
-    # ========================================================
-    #
-    # THESE MUST REMAIN INSIDE `with gr.Blocks(...)`.
-    # ========================================================
+# ============================================================
+# PROCESS FLOW
+# ============================================================
 
-    process_button.click(
+def process_with_loader(file):
 
-        fn=process_with_loader,
-
-        inputs=[
-            file_input
-        ],
-
-        outputs=[
-            process_loader,
-            process_status,
-            upload_page,
-            search_page,
-            search_loader
-        ]
+    # Show loader first
+    yield (
+        gr.update(
+            visible=True
+        ),
+        "",
+        gr.update(
+            visible=True
+        ),
+        gr.update(
+            visible=False
+        ),
+        gr.update(
+            visible=False
+        )
     )
 
-
-    question.submit(
-
-        fn=search_document,
-
-        inputs=[
-            question
-        ],
-
-        outputs=[
-            search_loader,
-            answer_output,
-            sources_output,
-            search_status,
-            question
-        ]
+    status, message = process_document(
+        file
     )
 
+    if status == "ready":
 
-    reset_button.click(
+        yield (
+            gr.update(
+                visible=False
+            ),
+            message,
+            gr.update(
+                visible=False
+            ),
+            gr.update(
+                visible=True
+            ),
+            gr.update(
+                visible=False
+            )
+        )
 
-        fn=reset_app,
+    else:
 
-        inputs=[],
+        yield (
+            gr.update(
+                visible=False
+            ),
+            message,
+            gr.update(
+                visible=False
+            ),
+            gr.update(
+                visible=True
+            ),
+            gr.update(
+                visible=False
+            )
+        )
 
-        outputs=[
-            upload_page,
-            search_page,
-            file_input,
-            process_status,
-            search_loader,
-            answer_output,
-            sources_output
-        ]
-    )
+
+# ============================================================
+# EVENTS
+# ============================================================
+
+process_button.click(
+
+    fn=process_with_loader,
+
+    inputs=[
+        file_input
+    ],
+
+    outputs=[
+        process_loader,
+        process_status,
+        upload_page,
+        search_page,
+        search_loader
+    ]
+)
+
+
+question.submit(
+
+    fn=search_document,
+
+    inputs=[
+        question
+    ],
+
+    outputs=[
+        search_loader,
+        answer_output,
+        sources_output,
+        search_status,
+        question
+    ]
+)
+
+
+reset_button.click(
+
+    fn=reset_app,
+
+    inputs=[],
+
+    outputs=[
+        upload_page,
+        search_page,
+        file_input,
+        process_status,
+        search_loader,
+        answer_output,
+        sources_output
+    ]
+)
 
 
 # ============================================================
