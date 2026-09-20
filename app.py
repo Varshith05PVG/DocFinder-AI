@@ -1,4 +1,5 @@
 import os
+import spaces
 import re
 from pathlib import Path
 from typing import List, Dict
@@ -1646,6 +1647,7 @@ Page: {page}
 # LLM ANSWER
 # ============================================================
 
+@spaces.GPU
 def generate_answer(
     query: str,
     documents: List[Document]
@@ -1740,7 +1742,6 @@ Answer:
         )
 
     return answer
-
 
 # ============================================================
 # SOURCES

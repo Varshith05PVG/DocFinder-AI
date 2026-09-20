@@ -12,3 +12,4 @@ pytesseract
 Pillow
 python-docx
 rank-bm25
+spaces
