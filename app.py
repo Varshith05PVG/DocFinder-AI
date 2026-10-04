@@ -2,7 +2,7 @@ import os
 import gradio as gr
 import traceback
 import requests
-============================================
+
 # DOCUMENT PROCESSING IMPORTS
 # ============================================================
 import fitz
