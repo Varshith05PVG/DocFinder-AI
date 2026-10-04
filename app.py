@@ -1,7 +1,8 @@
 import os
 import gradio as gr
 import traceback
-# ============================================================
+import requests
+============================================
 # DOCUMENT PROCESSING IMPORTS
 # ============================================================
 import fitz
@@ -982,47 +983,72 @@ def process_document(file_path):
 
 
 # ============================================================
-# LLM LOADING  (CPU version for Render)
-# ============================================================
-
-def load_llm():
-    global llm
-
-    if llm is None:
-        llm = pipeline(
-            "text-generation",
-            model=LLM_MODEL,
-            max_new_tokens=MAX_NEW_TOKENS,
-            do_sample=False,
-            device=-1
-        )
-
-    return llm
-
-# ============================================================
 # ANSWER GENERATION
 # ============================================================
 def generate_answer(question, retrieved_chunks):
     """
-    Extractive answer without an LLM.
-    Returns the most relevant retrieved chunk from the document.
+    Generate a high-quality answer using Google Gemini's free API.
     """
     if not retrieved_chunks:
         return "No relevant information was found in the uploaded document."
 
-    # Take the top retrieved chunk as the answer
-    top_passage = retrieved_chunks[0].strip()
+    context = "\n\n".join(retrieved_chunks)
 
-    return (
-        f"**Here is the most relevant passage found in your document:**\n\n"
-        f"> {top_passage}\n\n"
-        f"*(Note: This is an extractive answer taken directly from your document, "
-        f"not a generative one. For best results, ask specific questions.)*"
-    )
+    api_key = os.environ.get("GEMINI_API_KEY", "")
 
+    if not api_key:
+        return (
+            f"**Most relevant passage:**\n\n"
+            f"> {retrieved_chunks[0].strip()}"
+        )
 
-   
+    prompt = f"""You are a document question-answering assistant.
 
+Answer the user's question using ONLY the information in the context below.
+
+If the answer is not present in the context, say:
+"I could not find that information in the document."
+
+Do not invent facts. Be concise and direct.
+
+Document context:
+{context}
+
+Question: {question}
+
+Answer:"""
+
+    try:
+        response = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}",
+            headers={"Content-Type": "application/json"},
+            json={
+                "contents": [
+                    {"parts": [{"text": prompt}]}
+                ],
+                "generationConfig": {
+                    "temperature": 0.2,
+                    "maxOutputTokens": 300
+                }
+            },
+            timeout=30
+        )
+
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Gemini API error {response.status_code}: {response.text[:200]}"
+            )
+
+        data = response.json()
+        answer = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        return answer
+
+    except Exception as exc:
+        return (
+            f"**AI answer failed, showing most relevant passage instead:**\n\n"
+            f"> {retrieved_chunks[0].strip()}\n\n"
+            f"*(Error: {str(exc)[:150]})*"
+        )
 # ============================================================
 # SOURCE FORMATTER
 # ============================================================
