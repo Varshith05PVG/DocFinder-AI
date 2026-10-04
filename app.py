@@ -23,9 +23,7 @@ from langchain_core.documents import (
     Document as LangChainDocument
 )
 
-from langchain_huggingface import (
-    HuggingFaceEmbeddings
-)
+from langchain_community.embeddings import FastEmbedEmbeddings
 
 from langchain_community.vectorstores import (
     FAISS
@@ -43,7 +41,7 @@ from rank_bm25 import BM25Okapi
 APP_TITLE = "DocFinder AI"
 
 EMBEDDING_MODEL = (
-    "sentence-transformers/all-MiniLM-L6-v2"
+    "BAAI/bge-small-en-v1.5"
 )
 
 LLM_MODEL = (
@@ -634,13 +632,10 @@ def create_vector_store(chunks):
     # --------------------------------------------------------
     # LOAD EMBEDDING MODEL
     # --------------------------------------------------------
-
     if embedding_model is None:
-        embedding_model = HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL,
-        model_kwargs={"device": "cpu"},
-        encode_kwargs={"device": "cpu"})
-
+        embedding_model = FastEmbedEmbeddings(
+            model_name=EMBEDDING_MODEL
+        )
     # --------------------------------------------------------
     # CREATE LANGCHAIN DOCUMENTS
     # --------------------------------------------------------
