@@ -989,7 +989,7 @@ def generate_answer(question, retrieved_chunks):
 
     context = "\n\n".join(retrieved_chunks)
 
-    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    api_key = os.environ.get("OPEN_ROUTER_API", "")
 
     if not api_key:
         return (
