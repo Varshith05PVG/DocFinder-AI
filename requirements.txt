@@ -7,8 +7,7 @@ langchain
 langchain-core
 langchain-community
 langchain-text-splitters
-langchain-huggingface
-sentence-transformers
+fastembed
 faiss-cpu
 rank_bm25
 requests
