@@ -982,14 +982,14 @@ def process_document(file_path):
 # ============================================================
 def generate_answer(question, retrieved_chunks):
     """
-    Generate a high-quality answer using Google Gemini's free API.
+    Generate a high-quality answer using OpenRouter's free API.
     """
     if not retrieved_chunks:
         return "No relevant information was found in the uploaded document."
 
     context = "\n\n".join(retrieved_chunks)
 
-    api_key = os.environ.get("GEMINI_API_KEY", "")
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
 
     if not api_key:
         return (
@@ -997,14 +997,14 @@ def generate_answer(question, retrieved_chunks):
             f"> {retrieved_chunks[0].strip()}"
         )
 
-    prompt = f"""You are a document question-answering assistant.
+    prompt = f"""You are a precise document Q&A assistant.
 
-Answer the user's question using ONLY the information in the context below.
+Answer ONLY the specific question asked, using the context below.
 
-If the answer is not present in the context, say:
-"I could not find that information in the document."
+If the answer is not in the context, say:
+"Not found in the document."
 
-Do not invent facts. Be concise and direct.
+Be concise and direct. Do NOT summarize the whole document.
 
 Document context:
 {context}
@@ -1015,32 +1015,35 @@ Answer:"""
 
     try:
         response = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key={api_key}",
-            headers={"Content-Type": "application/json"},
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            },
             json={
-                "contents": [
-                    {"parts": [{"text": prompt}]}
+                "model": "meta-llama/llama-3.2-3b-instruct:free",
+                "messages": [
+                    {"role": "user", "content": prompt}
                 ],
-                "generationConfig": {
-                    "temperature": 0.2,
-                    "maxOutputTokens": 300
-                }
+                "temperature": 0.2,
+                "max_tokens": 300
             },
             timeout=30
         )
 
         if response.status_code != 200:
             raise RuntimeError(
-                f"Gemini API error {response.status_code}: {response.text[:200]}"
+                f"OpenRouter error {response.status_code}: "
+                f"{response.text[:200]}"
             )
 
         data = response.json()
-        answer = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        answer = data["choices"][0]["message"]["content"].strip()
         return answer
 
     except Exception as exc:
         return (
-            f"**AI answer failed, showing most relevant passage instead:**\n\n"
+            f"**AI answer failed, showing passage instead:**\n\n"
             f"> {retrieved_chunks[0].strip()}\n\n"
             f"*(Error: {str(exc)[:150]})*"
         )
