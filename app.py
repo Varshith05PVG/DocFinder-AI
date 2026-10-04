@@ -35,13 +35,6 @@ from rank_bm25 import BM25Okapi
 # ============================================================
 # LLM IMPORT
 # ============================================================
-
-from transformers import pipeline
-import torch
-
-print("TORCH VERSION:", torch.__version__)
-print("CUDA AVAILABLE:", torch.cuda.is_available())
-
 # ============================================================
 # APP CONFIGURATION
 # ============================================================
@@ -1009,49 +1002,26 @@ def load_llm():
 # ============================================================
 # ANSWER GENERATION
 # ============================================================
-
-
 def generate_answer(question, retrieved_chunks):
+    """
+    Extractive answer without an LLM.
+    Returns the most relevant retrieved chunk from the document.
+    """
+    if not retrieved_chunks:
+        return "No relevant information was found in the uploaded document."
 
-    model = load_llm()
+    # Take the top retrieved chunk as the answer
+    top_passage = retrieved_chunks[0].strip()
 
-    context = "\n\n".join(
-        retrieved_chunks
+    return (
+        f"**Here is the most relevant passage found in your document:**\n\n"
+        f"> {top_passage}\n\n"
+        f"*(Note: This is an extractive answer taken directly from your document, "
+        f"not a generative one. For best results, ask specific questions.)*"
     )
 
-    prompt = f"""
-You are a document question-answering assistant.
 
-Answer the user's question using ONLY the information
-provided in the document context.
-
-If the answer is not present in the context,
-say that the answer was not found in the document.
-
-Do not invent facts.
-
-Document context:
-{context}
-
-Question:
-{question}
-
-Answer:
-"""
-
-    result = model(
-        prompt
-    )
-
-    generated_text = result[0]["generated_text"]
-
-    if generated_text.startswith(prompt):
-
-        generated_text = generated_text[
-            len(prompt):
-        ]
-
-    return generated_text.strip()
+   
 
 # ============================================================
 # SOURCE FORMATTER
